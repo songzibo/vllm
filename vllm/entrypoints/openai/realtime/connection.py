@@ -4,11 +4,13 @@
 import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator
+from io import BytesIO
+from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from uuid import uuid4
 
 import numpy as np
+from PIL import Image
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
@@ -18,6 +20,10 @@ from vllm.entrypoints.openai.realtime.protocol import (
     ErrorEvent,
     InputAudioBufferAppend,
     InputAudioBufferCommit,
+    InputVideoBufferAppend,
+    InputVideoBufferCommit,
+    ResponseDelta,
+    ResponseDone,
     SessionCreated,
     TranscriptionDelta,
     TranscriptionDone,
@@ -45,10 +51,12 @@ class RealtimeConnection:
         self.connection_id = f"ws-{uuid4()}"
         self.serving = serving
         self.audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
+        self.video_queue: asyncio.Queue[Image.Image | None] = asyncio.Queue()
         self.generation_task: asyncio.Task | None = None
 
         self._is_connected = False
         self._is_input_finished = False
+        self._is_video_input_finished = False
         self._is_model_validated = False
 
         self._max_audio_filesize_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
@@ -99,6 +107,8 @@ class RealtimeConnection:
         - session.update: Configure model
         - input_audio_buffer.append: Add audio chunk to queue
         - input_audio_buffer.commit: Start transcription generation
+        - input_video_buffer.append: Add video frame to queue
+        - input_video_buffer.commit: Start video generation
         """
         event_type = event.get("type")
         if event_type == "session.update":
@@ -148,6 +158,33 @@ class RealtimeConnection:
                 self._is_input_finished = True
             else:
                 await self.start_generation()
+        elif event_type == "input_video_buffer.append":
+            append_event = InputVideoBufferAppend(**event)
+            try:
+                frame_bytes = base64.b64decode(append_event.frame)
+                frame = Image.open(BytesIO(frame_bytes)).convert("RGB")
+                if frame.size[0] == 0 or frame.size[1] == 0:
+                    raise VLLMValidationError("Can't process empty frame.")
+                self.video_queue.put_nowait(frame)
+            except Exception as e:
+                logger.error("Failed to decode video frame: %s", e)
+                await self.send_error("Invalid video frame", "invalid_frame")
+        elif event_type == "input_video_buffer.commit":
+            if not self._is_model_validated:
+                err_msg = (
+                    "Model not validated. Make sure to validate the"
+                    " model by sending a session.update event."
+                )
+                await self.send_error(
+                    err_msg,
+                    "model_not_validated",
+                )
+
+            commit_event = InputVideoBufferCommit(**event)
+            if commit_event.final:
+                self._is_video_input_finished = True
+            else:
+                await self.start_video_generation()
         else:
             await self.send_error(f"Unknown event type: {event_type}", "unknown_event")
 
@@ -158,6 +195,14 @@ class RealtimeConnection:
             if audio_chunk is None:  # Sentinel value to stop
                 break
             yield audio_chunk
+
+    async def video_stream_generator(self) -> AsyncGenerator[Image.Image, None]:
+        """Generator that yields video frames from the queue."""
+        while True:
+            frame = await self.video_queue.get()
+            if frame is None:
+                break
+            yield frame
 
     async def start_generation(self):
         """Start the transcription generation task."""
@@ -176,13 +221,47 @@ class RealtimeConnection:
 
         # Start generation task
         self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream)
+            self._run_generation(
+                streaming_input_gen,
+                input_stream,
+                input_queue=self.audio_queue,
+                is_input_finished=lambda: self._is_input_finished,
+            )
+        )
+
+    async def start_video_generation(self):
+        """Start the video generation task."""
+        if self.generation_task is not None and not self.generation_task.done():
+            logger.warning("Generation already in progress, ignoring commit")
+            return
+
+        video_stream = self.video_stream_generator()
+        input_stream = asyncio.Queue[list[int]]()
+
+        streaming_input_gen = self.serving.process_realtime_video(
+            video_stream, input_stream
+        )
+
+        self.generation_task = asyncio.create_task(
+            self._run_generation(
+                streaming_input_gen,
+                input_stream,
+                delta_event_cls=ResponseDelta,
+                done_event_cls=ResponseDone,
+                input_queue=self.video_queue,
+                is_input_finished=lambda: self._is_video_input_finished,
+            )
         )
 
     async def _run_generation(
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
+        *,
+        delta_event_cls: type[TranscriptionDelta | ResponseDelta] = TranscriptionDelta,
+        done_event_cls: type[TranscriptionDone | ResponseDone] = TranscriptionDone,
+        input_queue: asyncio.Queue | None = None,
+        is_input_finished: Callable[[], bool] | None = None,
     ):
         """Run the generation and stream results back to the client.
 
@@ -231,7 +310,7 @@ class RealtimeConnection:
 
                     # append output to input
                     input_stream.put_nowait(list(output.outputs[0].token_ids))
-                    await self.send(TranscriptionDelta(delta=delta))
+                    await self.send(delta_event_cls(delta=delta))
 
                     completion_tokens_len += len(output.outputs[0].token_ids)
 
@@ -239,8 +318,13 @@ class RealtimeConnection:
                     # finish because websocket connection was killed
                     break
 
-                if self.audio_queue.empty() and self._is_input_finished:
-                    # finish because client signals that audio input
+                if (
+                    input_queue is not None
+                    and is_input_finished is not None
+                    and input_queue.empty()
+                    and is_input_finished()
+                ):
+                    # finish because client signals that input
                     # is finished
                     break
 
@@ -251,18 +335,23 @@ class RealtimeConnection:
             )
 
             # Send final completion event
-            await self.send(TranscriptionDone(text=full_text, usage=usage))
+            await self.send(done_event_cls(text=full_text, usage=usage))
 
-            # Clear queue for next utterance
-            while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
+            if input_queue is not None:
+                while not input_queue.empty():
+                    input_queue.get_nowait()
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
 
     async def send(
-        self, event: SessionCreated | TranscriptionDelta | TranscriptionDone
+        self,
+        event: SessionCreated
+        | TranscriptionDelta
+        | TranscriptionDone
+        | ResponseDelta
+        | ResponseDone,
     ):
         """Send event to client."""
         data = event.model_dump_json()
@@ -277,6 +366,7 @@ class RealtimeConnection:
         """Cleanup resources."""
         # Signal audio stream to stop
         self.audio_queue.put_nowait(None)
+        self.video_queue.put_nowait(None)
 
         # Cancel generation task if running
         if self.generation_task and not self.generation_task.done():

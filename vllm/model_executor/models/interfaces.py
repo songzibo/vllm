@@ -1072,6 +1072,21 @@ class SupportsRealtime(Protocol):
     ) -> AsyncGenerator[PromptType, None]: ...
 
 
+@runtime_checkable
+class SupportsRealtimeVideo(Protocol):
+    """The interface required for all models that support realtime video."""
+
+    supports_realtime_video: ClassVar[Literal[True]] = True
+
+    @classmethod
+    async def buffer_realtime_video(
+        cls,
+        video_stream: AsyncGenerator["Image.Image", None],
+        input_stream: asyncio.Queue[list[int]],
+        model_config: ModelConfig,
+    ) -> AsyncGenerator[PromptType, None]: ...
+
+
 @overload
 def supports_realtime(
     model: type[object],

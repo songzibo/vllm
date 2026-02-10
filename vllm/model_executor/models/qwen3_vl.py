@@ -24,7 +24,15 @@
 # limitations under the License.
 """Inference-only Qwen3VL model compatible with HuggingFace weights."""
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+import asyncio
+from collections.abc import (
+    AsyncGenerator,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from functools import lru_cache, partial
 from itertools import islice
 from typing import Any
@@ -33,6 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from transformers import BatchFeature
 from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
@@ -49,7 +58,8 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
 from transformers.video_utils import VideoMetadata
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm import envs
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
@@ -90,12 +100,14 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsRealtimeVideo,
     SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
@@ -1216,6 +1228,7 @@ class Qwen3LLMForCausalLM(Qwen3ForCausalLM):
 class Qwen3VLForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
+    SupportsRealtimeVideo,
     SupportsLoRA,
     SupportsPP,
     SupportsMRoPE,
@@ -1265,6 +1278,7 @@ class Qwen3VLForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.video_pruning_rate = multimodal_config.video_pruning_rate
+        self.vllm_config = vllm_config
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()
         )
@@ -2099,3 +2113,45 @@ class Qwen3VLForConditionalGeneration(
         vision_config = hf_config.vision_config
         merge_size = vision_config.spatial_merge_size
         return num_vision_tokens // merge_size**2
+
+    @classmethod
+    async def buffer_realtime_video(
+        cls,
+        video_stream: AsyncGenerator[Image.Image, None],
+        input_stream: asyncio.Queue[list[int]],
+        model_config: ModelConfig,
+    ) -> AsyncGenerator[PromptType, None]:
+        tokenizer = cached_tokenizer_from_config(model_config)
+        placeholder = cls.get_placeholder_str("video", 0)
+        if placeholder is None:
+            raise ValueError("Qwen3-VL does not provide a video placeholder.")
+
+        prompt = f"<|im_start|>user\n{placeholder}<|im_end|>\n<|im_start|>assistant\n"
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        frames_buffer: list[Image.Image] = []
+        chunk_size = 8
+
+        async for frame in video_stream:
+            frames_buffer.append(frame)
+            if len(frames_buffer) < chunk_size:
+                continue
+
+            if not input_stream.empty():
+                await asyncio.wait_for(
+                    input_stream.get(), timeout=envs.VLLM_ENGINE_ITERATION_TIMEOUT_S
+                )
+
+            multi_modal_data = {"video": [frames_buffer.copy()]}
+            yield TokensPrompt(
+                prompt_token_ids=prompt_token_ids,
+                multi_modal_data=multi_modal_data,
+            )
+            frames_buffer.clear()
+
+        if frames_buffer:
+            multi_modal_data = {"video": [frames_buffer.copy()]}
+            yield TokensPrompt(
+                prompt_token_ids=prompt_token_ids,
+                multi_modal_data=multi_modal_data,
+            )

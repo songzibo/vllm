@@ -29,6 +29,22 @@ class InputAudioBufferCommit(OpenAIBaseModel):
     final: bool = False
 
 
+class InputVideoBufferAppend(OpenAIBaseModel):
+    """Append video frame to buffer"""
+
+    type: Literal["input_video_buffer.append"] = "input_video_buffer.append"
+    frame: str  # base64-encoded PNG frame
+    frame_idx: int | None = None
+    timestamp_ms: int | None = None
+
+
+class InputVideoBufferCommit(OpenAIBaseModel):
+    """Process accumulated video buffer"""
+
+    type: Literal["input_video_buffer.commit"] = "input_video_buffer.commit"
+    final: bool = False
+
+
 # Server -> Client Events
 class SessionUpdate(OpenAIBaseModel):
     """Configure session parameters"""
@@ -57,6 +73,21 @@ class TranscriptionDone(OpenAIBaseModel):
 
     type: Literal["transcription.done"] = "transcription.done"
     text: str  # Complete transcription
+    usage: UsageInfo | None = None
+
+
+class ResponseDelta(OpenAIBaseModel):
+    """Incremental response text"""
+
+    type: Literal["response.delta"] = "response.delta"
+    delta: str
+
+
+class ResponseDone(OpenAIBaseModel):
+    """Final response with usage stats"""
+
+    type: Literal["response.done"] = "response.done"
+    text: str
     usage: UsageInfo | None = None
 
 
