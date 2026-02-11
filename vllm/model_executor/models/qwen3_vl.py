@@ -24,7 +24,15 @@
 # limitations under the License.
 """Inference-only Qwen3VL model compatible with HuggingFace weights."""
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+import asyncio
+from collections.abc import (
+    AsyncGenerator,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from functools import lru_cache, partial
 from itertools import islice
 from typing import Any
@@ -33,6 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from transformers import BatchFeature
 from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
@@ -49,9 +58,11 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
 from transformers.video_utils import VideoMetadata
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.distributed import get_pp_group
+from vllm.envs import VLLM_ENGINE_ITERATION_TIMEOUT_S
+from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.conv import Conv3dLayer
@@ -102,6 +113,7 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsMultiModalPruning,
     SupportsPP,
+    SupportsRealtimeVideo,
     _require_is_multimodal,
 )
 from .qwen2_5_vl import (
@@ -1221,6 +1233,7 @@ class Qwen3VLForConditionalGeneration(
     SupportsMRoPE,
     SupportsEagle3,
     SupportsMultiModalPruning,
+    SupportsRealtimeVideo,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1236,6 +1249,7 @@ class Qwen3VLForConditionalGeneration(
     }
 
     supports_encoder_tp_data = True
+    supports_realtime_video: ClassVar[Literal[True]] = True
 
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
@@ -1304,6 +1318,51 @@ class Qwen3VLForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    @classmethod
+    async def buffer_realtime_video(
+        cls,
+        video_stream: AsyncGenerator[Image.Image, None],
+        input_stream: asyncio.Queue[list[int]],
+        model_config: ModelConfig,
+    ) -> AsyncGenerator[PromptType, None]:
+        """Build realtime video prompts from a stream of frames."""
+        tokenizer = cached_tokenizer_from_config(model_config)
+        prompt = (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>\n"
+            "Describe the video.\n<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        frames: list[Image.Image] = []
+        is_first_yield = True
+        fps = 1.0
+
+        async for frame in video_stream:
+            frames.append(frame)
+            if is_first_yield:
+                token_ids = prompt_token_ids
+            else:
+                all_outputs = await asyncio.wait_for(
+                    input_stream.get(), timeout=VLLM_ENGINE_ITERATION_TIMEOUT_S
+                )
+                token_ids = all_outputs[-1:]
+
+            metadata = {
+                "fps": fps,
+                "duration": len(frames) / fps,
+                "total_num_frames": len(frames),
+                "video_backend": "realtime",
+                "frames_indices": list(range(len(frames))),
+                "do_sample_frames": False,
+            }
+            multi_modal_data = {"video": [(list(frames), metadata)]}
+            yield TokensPrompt(
+                prompt_token_ids=token_ids,
+                multi_modal_data=multi_modal_data,
+            )
+            is_first_yield = False
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.language_model.model.aux_hidden_state_layers = layers

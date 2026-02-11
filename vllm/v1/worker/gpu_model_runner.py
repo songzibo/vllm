@@ -73,6 +73,7 @@ from vllm.model_executor.models.interfaces import (
     supports_mrope,
     supports_multimodal_pruning,
     supports_realtime,
+    supports_realtime_video,
     supports_transcription,
     supports_xdrope,
 )
@@ -2575,6 +2576,9 @@ class GPUModelRunner(
 
         if supports_realtime(model):
             supported_tasks.append("realtime")
+
+        if supports_realtime_video(model):
+            supported_tasks.append("video_realtime")
 
         return supported_tasks
 

@@ -204,6 +204,13 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
 
         register_realtime_api_router(app)
 
+    if "video_realtime" in supported_tasks:
+        from vllm.entrypoints.openai.video_realtime.api_router import (
+            attach_router as register_video_realtime_api_router,
+        )
+
+        register_video_realtime_api_router(app)
+
     if any(task in POOLING_TASKS for task in supported_tasks):
         from vllm.entrypoints.pooling import register_pooling_api_routers
 
@@ -331,6 +338,15 @@ async def init_app_state(
         from vllm.entrypoints.openai.realtime.api_router import init_realtime_state
 
         init_realtime_state(engine_client, state, args, request_logger, supported_tasks)
+
+    if "video_realtime" in supported_tasks:
+        from vllm.entrypoints.openai.video_realtime.api_router import (
+            init_video_realtime_state,
+        )
+
+        init_video_realtime_state(
+            engine_client, state, args, request_logger, supported_tasks
+        )
 
     if any(task in POOLING_TASKS for task in supported_tasks):
         from vllm.entrypoints.pooling import init_pooling_state
