@@ -6,6 +6,8 @@
 import asyncio
 from collections.abc import AsyncGenerator
 
+import numpy as np
+
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
@@ -66,10 +68,28 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
             chunk = await video_chunk_queue.get()
             if chunk is None:
                 break
+            # Empty list = text-only turn (e.g. commit with no frames, or text after video).
             if not chunk:
+                yield StreamingInput(
+                    prompt=TextPrompt(prompt=prompt_text),
+                )
                 continue
+            # Models like Qwen2-VL/Qwen3-VL require video metadata (fps, frames_indices, etc.).
+            # Build (video_array, metadata) tuple; metadata format matches vllm video loaders.
+            num_frames = len(chunk)
+            frames_array = np.stack([np.array(img) for img in chunk])
+            # Default fps=1 for streaming (no real timeline); duration = num_frames seconds.
+            fps = 1.0
+            metadata = {
+                "total_num_frames": num_frames,
+                "fps": fps,
+                "duration": num_frames / fps,
+                "video_backend": "realtime_stream",
+                "frames_indices": list(range(num_frames)),
+                "do_sample_frames": True,
+            }
             prompt: TextPrompt = TextPrompt(
                 prompt=prompt_text,
-                multi_modal_data={"video": chunk},
+                multi_modal_data={"video": (frames_array, metadata)},
             )
             yield StreamingInput(prompt=prompt)

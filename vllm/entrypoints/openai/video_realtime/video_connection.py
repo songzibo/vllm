@@ -34,7 +34,6 @@ logger = init_logger(__name__)
 # Max frames per commit to avoid OOM (configurable via env if needed).
 DEFAULT_MAX_FRAMES_PER_COMMIT = 64
 
-
 def _decode_video_frame(payload_b64: str, fmt: str | None):
     """Decode base64 to a single frame (PIL Image) for multi_modal_data."""
     raw = base64.b64decode(payload_b64)
@@ -57,6 +56,8 @@ class RealtimeVideoConnection:
     - Session: session.update (model, optional prompt)
     - Append: input_video_buffer.append (base64 frame/chunk)
     - Commit: input_video_buffer.commit (process buffer, optional final)
+      - With frames: process video + prompt. With no frames: text-only turn (prompt only).
+      - So "text-only" or "text first then streaming video" are supported.
     - Server sends: completion.delta, completion.done, error
     """
 
@@ -147,9 +148,13 @@ class RealtimeVideoConnection:
             commit_evt = InputVideoBufferCommit(**event)
             if commit_evt.final:
                 self._is_input_finished = True
+            # Always enqueue: frames → video chunk; no frames → text-only chunk (empty list)
+            # So "text-only" or "text first, then video" both work: set prompt then commit.
             if self._frame_buffer:
                 self._video_chunk_queue.put_nowait(list(self._frame_buffer))
                 self._frame_buffer = []
+            else:
+                self._video_chunk_queue.put_nowait([])
             if commit_evt.final:
                 self._video_chunk_queue.put_nowait(None)
             if self.generation_task is None or self.generation_task.done():

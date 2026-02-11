@@ -161,15 +161,15 @@ def main():
     )
     parser.add_argument("--model", type=str, default="Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--prompt", type=str, default=None)
-    parser.add_argument("--image_path", type=str, default=None)
-    parser.add_argument("--video_path", type=str, default=None)
+    parser.add_argument("--image-path", type=str, default=None)
+    parser.add_argument("--video-path", type=str, default=None)
     parser.add_argument("--max_frames", type=int, default=32)
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     if not args.image_path and not args.video_path:
-        parser.error("Provide at least one of --image_path or --video_path")
+        parser.error("Provide at least one of --image-path or --video-path")
 
     asyncio.run(
         run_realtime_video(

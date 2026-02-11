@@ -39,11 +39,15 @@ async def realtime_video_endpoint(websocket: WebSocket):
     1. Client connects to ws://host/v1/realtime_video
     2. Server sends session.created
     3. Client sends session.update with model (and optional prompt)
-    4. Client sends input_video_buffer.commit to start
+    4. Client sends input_video_buffer.commit to start (or to run text-only)
     5. Client sends input_video_buffer.append with base64-encoded frames (e.g. JPEG)
     6. Client sends input_video_buffer.commit to process buffer
     7. Server sends completion.delta then completion.done
     8. Repeat from step 5; use input_video_buffer.commit with final=True when done
+
+    Text-only or text-then-video: send session.update with prompt, then
+    input_video_buffer.commit with no frames for text-only; or append frames
+    then commit for text + video. Empty commit = one text-only turn.
     """
     app = websocket.app
     serving = getattr(app.state, "openai_serving_realtime_video", None)
