@@ -198,18 +198,38 @@ class RealtimeVideoConnection:
                 request_id=request_id,
             )
 
+            out_iter = 0
             async for output in result_gen:
                 if output.outputs and len(output.outputs) > 0:
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
                     delta = output.outputs[0].text
+                    n_tokens = len(output.outputs[0].token_ids)
                     full_text += delta
                     await self._send(CompletionDelta(delta=delta))
-                    completion_tokens_len += len(output.outputs[0].token_ids)
+                    completion_tokens_len += n_tokens
+                    logger.info(
+                        "[realtime_video] output iter=%s delta=%r n_tokens=%s "
+                        "full_len=%s queue_empty=%s input_finished=%s",
+                        out_iter,
+                        delta,
+                        n_tokens,
+                        len(full_text),
+                        self._video_chunk_queue.empty(),
+                        self._is_input_finished,
+                    )
+                out_iter += 1
                 if not self._is_connected:
+                    logger.info("[realtime_video] break: connection closed")
                     break
-                if self._video_chunk_queue.empty() and self._is_input_finished:
-                    break
+                # Do NOT break when queue empty and input_finished: consume all
+                # outputs from this generation (model may yield one delta per token).
+
+            logger.info(
+                "[realtime_video] gen done full_text_len=%s completion_tokens=%s",
+                len(full_text),
+                completion_tokens_len,
+            )
 
             usage = UsageInfo(
                 prompt_tokens=prompt_token_ids_len,
