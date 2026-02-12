@@ -16,14 +16,20 @@ Requirements:
 - opencv-python (optional, for video files)
 
 Usage:
-  # From a video file (extracts frames)
-  python openai_realtime_video_client.py --video_path /path/to/video.mp4
+  # From a video file (sends all frames by default)
+  python openai_realtime_video_client.py --video-path /path/to/video.mp4
+
+  # Send every 25th frame (e.g. 1 frame per second for 25fps video)
+  python openai_realtime_video_client.py --video-path /path/to/video.mp4 --frame-interval 25
+
+  # Limit to 32 frames, every 10th frame
+  python openai_realtime_video_client.py --video-path /path/to/video.mp4 --max-frames 32 --frame-interval 10
 
   # From a single image
-  python openai_realtime_video_client.py --image_path /path/to/image.jpg
+  python openai_realtime_video_client.py --image-path /path/to/image.jpg
 
   # Custom prompt and model
-  python openai_realtime_video_client.py --image_path frame.jpg --prompt "What is in this image?" --model Qwen2.5-VL-7B-Instruct
+  python openai_realtime_video_client.py --image-path frame.jpg --prompt "What is in this image?" --model Qwen2.5-VL-7B-Instruct
 """
 
 import argparse
@@ -57,26 +63,43 @@ def image_to_base64_jpeg(image_path: str, quality: int = 85) -> str:
 
 
 def video_frames_to_base64_jpeg(
-    video_path: str, max_frames: int = 32, quality: int = 85
+    video_path: str,
+    max_frames: int | None = None,
+    frame_interval: int = 1,
+    quality: int = 85,
 ) -> list[str]:
-    """Read video file and return list of base64-encoded JPEG frames."""
+    """Read video file and return list of base64-encoded JPEG frames.
+
+    Args:
+        video_path: Path to the video file.
+        max_frames: Max number of frames to send; None = no limit (send all sampled).
+        frame_interval: Send every Nth frame (1 = every frame, 25 = every 25th frame).
+        quality: JPEG quality for encoding.
+    """
     if cv2 is None:
         raise RuntimeError(
             "opencv-python is required for video. Install with: pip install opencv-python"
         )
     if Image is None:
         raise RuntimeError("PIL is required. Install with: pip install Pillow")
+    if frame_interval < 1:
+        raise ValueError("frame_interval must be >= 1")
     cap = cv2.VideoCapture(video_path)
     frames = []
-    while len(frames) < max_frames:
+    frame_idx = 0
+    while True:
+        if max_frames is not None and len(frames) >= max_frames:
+            break
         ret, bgr = cap.read()
         if not ret:
             break
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-        frames.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+        if frame_idx % frame_interval == 0:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            frames.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+        frame_idx += 1
     cap.release()
     return frames
 
@@ -88,7 +111,8 @@ async def run_realtime_video(
     prompt: str | None,
     image_path: str | None,
     video_path: str | None,
-    max_frames: int,
+    max_frames: int | None,
+    frame_interval: int,
 ):
     uri = f"ws://{host}:{port}/v1/realtime_video"
 
@@ -121,8 +145,13 @@ async def run_realtime_video(
             )
             await ws.send(json.dumps({"type": "input_video_buffer.commit", "final": True}))
         elif video_path:
-            print(f"Loading video: {video_path} (max {max_frames} frames)")
-            frames_b64 = video_frames_to_base64_jpeg(video_path, max_frames=max_frames)
+            limit_str = f"max {max_frames} frames" if max_frames is not None else "all frames"
+            print(f"Loading video: {video_path} ({limit_str}, every {frame_interval} frame(s))")
+            frames_b64 = video_frames_to_base64_jpeg(
+                video_path,
+                max_frames=max_frames,
+                frame_interval=frame_interval,
+            )
             print(f"Sending {len(frames_b64)} frames...")
             for b64 in frames_b64:
                 await ws.send(
@@ -136,7 +165,7 @@ async def run_realtime_video(
                 )
             await ws.send(json.dumps({"type": "input_video_buffer.commit", "final": True}))
         else:
-            print("Provide --image_path or --video_path")
+            print("Provide --image-path or --video-path")
             return
 
         print("Waiting for completion...\n")
@@ -163,7 +192,18 @@ def main():
     parser.add_argument("--prompt", type=str, default=None)
     parser.add_argument("--image-path", type=str, default=None)
     parser.add_argument("--video-path", type=str, default=None)
-    parser.add_argument("--max_frames", type=int, default=32)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Max frames to send from video; default None = send all (after sampling).",
+    )
+    parser.add_argument(
+        "--frame-interval",
+        type=int,
+        default=1,
+        help="Send every Nth frame (1=every frame, 25=every 25th frame). Default: 1.",
+    )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -180,6 +220,7 @@ def main():
             args.image_path,
             args.video_path,
             args.max_frames,
+            args.frame_interval,
         )
     )
 
