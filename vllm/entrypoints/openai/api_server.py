@@ -189,6 +189,11 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
         )
 
         register_generate_api_routers(app)
+        from vllm.entrypoints.openai.video_realtime.api_router import (
+            attach_router as attach_video_realtime_router,
+        )
+
+        attach_video_realtime_router(app)
 
     if "transcription" in supported_tasks:
         from vllm.entrypoints.openai.speech_to_text.api_router import (
@@ -331,6 +336,15 @@ async def init_app_state(
         from vllm.entrypoints.openai.realtime.api_router import init_realtime_state
 
         init_realtime_state(engine_client, state, args, request_logger, supported_tasks)
+
+    if "generate" in supported_tasks:
+        from vllm.entrypoints.openai.video_realtime.api_router import (
+            init_realtime_video_state,
+        )
+
+        init_realtime_video_state(
+            engine_client, state, args, request_logger, supported_tasks
+        )
 
     if any(task in POOLING_TASKS for task in supported_tasks):
         from vllm.entrypoints.pooling import init_pooling_state
