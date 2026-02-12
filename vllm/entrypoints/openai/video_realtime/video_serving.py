@@ -66,31 +66,18 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
     ) -> AsyncGenerator[StreamingInput, None]:
         """Turn queued video batches into StreamingInput for engine.generate().
 
-        Video is sent frame-by-frame; one batch = one commit's worth of frames (list of
-        PIL Images). None in the queue signals end of stream.
-
-        Args:
-            video_batch_queue: Queue of frame lists (one per commit); None = EOS.
-            prompt_text: Text prompt to use with each batch.
-
-        Yields:
-            StreamingInput with TextPrompt + multi_modal_data["video"].
+        One batch (one commit) → one StreamingInput. None in the queue signals EOS.
+        Caller can advance this generator once per batch and run one generate per yield.
         """
         while True:
             batch = await video_batch_queue.get()
             if batch is None:
                 break
-            # Empty list = text-only turn (e.g. commit with no frames, or text after video).
             if not batch:
-                yield StreamingInput(
-                    prompt=TextPrompt(prompt=prompt_text),
-                )
+                yield StreamingInput(prompt=TextPrompt(prompt=prompt_text))
                 continue
-            # Models like Qwen2-VL/Qwen3-VL require video metadata (fps, frames_indices, etc.).
-            # Build (video_array, metadata) tuple; metadata format matches vllm video loaders.
             num_frames = len(batch)
             frames_array = np.stack([np.array(img) for img in batch])
-            # Default fps=1 for streaming (no real timeline); duration = num_frames seconds.
             fps = 1.0
             metadata = {
                 "total_num_frames": num_frames,
@@ -100,20 +87,17 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
                 "frames_indices": list(range(num_frames)),
                 "do_sample_frames": True,
             }
-            # Prompt must contain the model's video placeholder for replacement.
             if VIDEO_PLACEHOLDER not in prompt_text:
                 user_content = VIDEO_PLACEHOLDER + " " + prompt_text
             else:
                 user_content = prompt_text
-            # Wrap in Qwen chat format so the model generates assistant reply (avoids
-            # single-token EOS when no assistant turn is present).
             effective_prompt = (
                 QWEN_CHAT_USER_PREFIX
                 + user_content
                 + QWEN_CHAT_USER_SUFFIX
                 + QWEN_CHAT_ASSISTANT_PREFIX
             )
-            prompt: TextPrompt = TextPrompt(
+            prompt = TextPrompt(
                 prompt=effective_prompt,
                 multi_modal_data={"video": (frames_array, metadata)},
             )

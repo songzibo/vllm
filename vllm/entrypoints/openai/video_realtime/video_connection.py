@@ -189,98 +189,79 @@ class RealtimeVideoConnection:
             await self._send_error(f"Unknown event type: {event_type}", "unknown_event")
 
     async def _start_generation(self):
-        """Start the generation task for the current video batch queue."""
+        """Start the generation loop: one engine.generate() per batch for real-time low latency."""
         if self.generation_task is not None and not self.generation_task.done():
             logger.warning("Generation already in progress, ignoring commit")
             return
+
+        self.generation_task = asyncio.create_task(self._run_generation_loop())
+
+    async def _run_generation_loop(self):
+        """One generate per batch: stream_video_realtime yields one StreamingInput per batch;
+        we run one engine.generate() per yield for real-time understanding."""
+        from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+        sampling_params = SamplingParams.from_optional(
+            temperature=0.0,
+            max_tokens=1024,
+            output_kind=RequestOutputKind.DELTA,
+            skip_clone=True,
+        )
 
         stream_gen = self.serving.stream_video_realtime(
             self._video_batch_queue,
             prompt_text=self._prompt_text,
         )
-        self.generation_task = asyncio.create_task(
-            self._run_generation(stream_gen)
-        )
-
-    async def _run_generation(self, streaming_input_gen):
-        """Run engine.generate with streaming input and send completion events."""
-        request_id = f"rt-video-{self.connection_id}-{uuid4()}"
-        full_text = ""
-        prompt_token_ids_len = 0
-        completion_tokens_len = 0
 
         try:
-            from vllm.sampling_params import RequestOutputKind, SamplingParams
-
-            sampling_params = SamplingParams.from_optional(
-                temperature=0.0,
-                max_tokens=1024,
-                output_kind=RequestOutputKind.DELTA,
-                skip_clone=True,
-            )
-
-            result_gen = self.serving.engine_client.generate(
-                prompt=streaming_input_gen,
-                sampling_params=sampling_params,
-                request_id=request_id,
-            )
-
-            out_iter = 0
-            async for output in result_gen:
-                if output.outputs and len(output.outputs) > 0:
-                    if not prompt_token_ids_len and output.prompt_token_ids:
-                        prompt_token_ids_len = len(output.prompt_token_ids)
-                    delta = output.outputs[0].text
-                    n_tokens = len(output.outputs[0].token_ids)
-                    full_text += delta
-                    await self._send(CompletionDelta(delta=delta))
-                    completion_tokens_len += n_tokens
-                    logger.debug(
-                        "[realtime_video] output iter=%s delta=%r n_tokens=%s "
-                        "full_len=%s queue_empty=%s input_finished=%s",
-                        out_iter,
-                        delta,
-                        n_tokens,
-                        len(full_text),
-                        self._video_batch_queue.empty(),
-                        self._is_input_finished,
-                    )
-                out_iter += 1
-                if not self._is_connected:
-                    logger.info("[realtime_video] break: connection closed")
-                    break
-                # Do NOT break when queue empty and input_finished: consume all
-                # outputs from this generation (model may yield one delta per token).
-
-            logger.info(
-                "[realtime_video] gen done full_text_len=%s completion_tokens=%s",
-                len(full_text),
-                completion_tokens_len,
-            )
-
-            usage = UsageInfo(
-                prompt_tokens=prompt_token_ids_len,
-                completion_tokens=completion_tokens_len,
-                total_tokens=prompt_token_ids_len + completion_tokens_len,
-            )
-            water_level = InputVideoBufferWaterLevel(
-                queue_depth=self._video_batch_queue.qsize(),
-                max_queue_size=self._video_batch_queue_maxsize - 1,
-                buffer_frames=len(self._frame_buffer),
-            )
-            await self._send(
-                CompletionDone(
-                    text=full_text,
-                    usage=usage,
-                    input_video_buffer=water_level,
-                )
-            )
-
-            while not self._video_batch_queue.empty():
+            while self._is_connected:
                 try:
-                    self._video_batch_queue.get_nowait()
-                except asyncio.QueueEmpty:
+                    streaming_input = await stream_gen.__anext__()
+                except StopAsyncIteration:
                     break
+
+                async def one_input():
+                    yield streaming_input
+
+                request_id = f"rt-video-{self.connection_id}-{uuid4()}"
+                full_text = ""
+                prompt_token_ids_len = 0
+                completion_tokens_len = 0
+
+                result_gen = self.serving.engine_client.generate(
+                    prompt=one_input(),
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+
+                async for output in result_gen:
+                    if output.outputs and len(output.outputs) > 0:
+                        if not prompt_token_ids_len and output.prompt_token_ids:
+                            prompt_token_ids_len = len(output.prompt_token_ids)
+                        delta = output.outputs[0].text
+                        full_text += delta
+                        await self._send(CompletionDelta(delta=delta))
+                        completion_tokens_len += len(output.outputs[0].token_ids)
+                    if not self._is_connected:
+                        break
+
+                usage = UsageInfo(
+                    prompt_tokens=prompt_token_ids_len,
+                    completion_tokens=completion_tokens_len,
+                    total_tokens=prompt_token_ids_len + completion_tokens_len,
+                )
+                water_level = InputVideoBufferWaterLevel(
+                    queue_depth=self._video_batch_queue.qsize(),
+                    max_queue_size=self._video_batch_queue_maxsize - 1,
+                    buffer_frames=len(self._frame_buffer),
+                )
+                await self._send(
+                    CompletionDone(
+                        text=full_text,
+                        usage=usage,
+                        input_video_buffer=water_level,
+                    )
+                )
 
         except asyncio.CancelledError:
             pass

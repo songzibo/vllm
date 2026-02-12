@@ -3,7 +3,9 @@
 """
 Demo client for the vLLM Realtime Video WebSocket API.
 
-Sends video frames (from a file or image) and prints streamed completion.
+Follows the protocol defined in vllm/entrypoints/openai/video_realtime/api_router.py:
+connect, session.update, then loop: get water level (queue_depth < max_queue_size),
+send one batch (appends + commit), recv completion.delta/done; use final=True on last batch.
 
 Before running, start vLLM with a vision model that supports video, e.g.:
 
@@ -110,14 +112,6 @@ def video_frames_to_base64_jpeg(
     return frames
 
 
-def _update_water_level(water_level: dict, msg: dict) -> None:
-    """Update shared water_level from server message (session.created, completion.done, or input_video_buffer.water_level)."""
-    w = msg.get("input_video_buffer") or msg
-    if "queue_depth" in w or "max_queue_size" in w:
-        water_level["queue_depth"] = w.get("queue_depth", water_level.get("queue_depth", 0))
-        water_level["max_queue_size"] = w.get("max_queue_size", water_level.get("max_queue_size", 1))
-
-
 async def run_realtime_video(
     host: str,
     port: int,
@@ -128,8 +122,8 @@ async def run_realtime_video(
     max_frames: int | None,
     frame_interval: int,
     batch_size: int,
-    water_level_poll_interval: float,
 ):
+    """Streaming video: one commit per batch; send rhythm is controlled by server water level (backpressure), not delay."""
     uri = f"ws://{host}:{port}/v1/realtime_video"
 
     async with websockets.connect(uri) as ws:
@@ -140,10 +134,8 @@ async def run_realtime_video(
         if msg.get("type") != "session.created":
             print(f"Unexpected: {msg}")
             return
+        initial_water = msg.get("input_video_buffer") or {}
         print(f"Session created: {msg.get('id', '')}")
-
-        water_level: dict = {"queue_depth": 0, "max_queue_size": 2}
-        _update_water_level(water_level, msg)
 
         payload = {"type": "session.update", "model": model}
         if prompt:
@@ -192,9 +184,10 @@ async def run_realtime_video(
                 max_frames=max_frames,
                 frame_interval=frame_interval,
             )
+            num_batches = (len(frames_b64) + batch_size - 1) // batch_size if batch_size else 0
             print(
-                f"Sending {len(frames_b64)} frames (batch_size={batch_size}, "
-                f"wait for water level before each batch)..."
+                f"Sending {len(frames_b64)} frames in {num_batches} batch(es) "
+                f"(batch_size={batch_size}); send when water level allows (queue_depth < max_queue_size)."
             )
             if max_frames is not None and len(frames_b64) > max_frames:
                 print(
@@ -203,46 +196,19 @@ async def run_realtime_video(
                     flush=True,
                 )
 
-            recv_done = asyncio.Event()
-            recv_error: str | None = None
+            # Single loop: get water level (from last recv), decide whether to send; else recv.
+            # Protocol: 4) get water level, decide; 5–6) send one batch (appends + commit); 7) recv until completion.done; 8) repeat.
+            queue_depth = 0
+            max_queue_size = initial_water.get("max_queue_size", 3)
+            batch_index = 0
+            received_done_count = 0
+            err: str | None = None
 
-            async def recv_loop() -> None:
-                nonlocal recv_error
-                try:
-                    while not recv_done.is_set():
-                        response = json.loads(await ws.recv())
-                        t = response.get("type")
-                        if t == "input_video_buffer.water_level":
-                            _update_water_level(water_level, response)
-                        elif t == "completion.delta":
-                            print(response.get("delta", ""), end="", flush=True)
-                        elif t == "completion.done":
-                            print(f"\n\nDone. Text: {response.get('text', '')}")
-                            if response.get("usage"):
-                                print(f"Usage: {response['usage']}")
-                            if response.get("input_video_buffer"):
-                                _update_water_level(water_level, response)
-                            recv_done.set()
-                            break
-                        elif t == "error":
-                            recv_error = response.get("error", response.get("message", str(response)))
-                            print(f"\nError: {recv_error}", flush=True)
-                            if response.get("code"):
-                                print(f"Code: {response['code']}", flush=True)
-                            recv_done.set()
-                            break
-                except Exception as e:
-                    recv_error = str(e)
-                    recv_done.set()
-
-            async def send_loop() -> None:
-                for i in range(0, len(frames_b64), batch_size):
-                    # Wait until server has capacity (queue_depth < max_queue_size).
-                    while water_level["queue_depth"] >= water_level["max_queue_size"]:
-                        await asyncio.sleep(water_level_poll_interval)
-                    if recv_done.is_set():
-                        return
-                    batch = frames_b64[i : i + batch_size]
+            while received_done_count < num_batches and err is None:
+                # 获取水位，判断是否需要发送
+                if batch_index < num_batches and queue_depth < max_queue_size:
+                    # 5–6) 发送一个批次：append 若干帧 + commit
+                    batch = frames_b64[batch_index * batch_size : (batch_index + 1) * batch_size]
                     for b64 in batch:
                         await ws.send(
                             json.dumps(
@@ -253,14 +219,37 @@ async def run_realtime_video(
                                 }
                             )
                         )
-                    is_final = i + batch_size >= len(frames_b64)
+                    is_final = batch_index == num_batches - 1
                     await ws.send(
                         json.dumps({"type": "input_video_buffer.commit", "final": is_final})
                     )
-
-            await asyncio.gather(send_loop(), recv_loop())
-            if recv_error:
-                return
+                    batch_index += 1
+                    queue_depth += 1  # optimistic until server sends next water level
+                    continue
+                # 7) 收一条消息，更新水位或处理 completion/error
+                response = json.loads(await ws.recv())
+                t = response.get("type")
+                if t == "completion.delta":
+                    print(response.get("delta", ""), end="", flush=True)
+                elif t == "completion.done":
+                    print(f"\n\n[Batch {received_done_count + 1}] {response.get('text', '')}")
+                    if response.get("usage"):
+                        print(f"Usage: {response['usage']}")
+                    received_done_count += 1
+                    buf = response.get("input_video_buffer")
+                    if buf is not None:
+                        queue_depth = buf.get("queue_depth", queue_depth)
+                        max_queue_size = buf.get("max_queue_size", max_queue_size)
+                elif t == "input_video_buffer.water_level":
+                    queue_depth = response.get("queue_depth", queue_depth)
+                    max_queue_size = response.get("max_queue_size", max_queue_size)
+                elif t == "error":
+                    err = response.get("error", response.get("message", str(response)))
+                    print(f"\nError: {err}", flush=True)
+                    if response.get("code"):
+                        print(f"Code: {response['code']}", flush=True)
+                else:
+                    print(f"[Received type={t!r}] {response}", flush=True)
         else:
             print("Provide --image-path or --video-path")
             return
@@ -292,13 +281,7 @@ def main():
         "--batch-size",
         type=int,
         default=16,
-        help="Frames per batch (one commit per batch). Wait for server water level before each batch.",
-    )
-    parser.add_argument(
-        "--water-level-poll-interval",
-        type=float,
-        default=0.05,
-        help="Seconds to sleep when waiting for server queue capacity (queue_depth < max_queue_size).",
+        help="Frames per batch; one commit per batch. Send rhythm is controlled by server water level (backpressure).",
     )
     args = parser.parse_args()
 
@@ -316,7 +299,6 @@ def main():
             args.max_frames,
             args.frame_interval,
             args.batch_size,
-            args.water_level_poll_interval,
         )
     )
 
