@@ -25,6 +25,13 @@ DEFAULT_VIDEO_PROMPT = "Describe what you see in the video."
 # prompt via session.update including the correct placeholder if needed).
 VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
 
+# Qwen-style chat wrapper so the model generates a full assistant reply instead of
+# stopping after one token (EOS). Without this, raw prompt has no "assistant" turn
+# and the model may emit EOS immediately.
+QWEN_CHAT_USER_PREFIX = "<|im_start|>user\n"
+QWEN_CHAT_USER_SUFFIX = "<|im_end|>\n"
+QWEN_CHAT_ASSISTANT_PREFIX = "<|im_start|>assistant\n"
+
 
 class OpenAIServingRealtimeVideo(OpenAIServing):
     """Realtime video understanding via WebSocket streaming.
@@ -95,9 +102,17 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
             }
             # Prompt must contain the model's video placeholder for replacement.
             if VIDEO_PLACEHOLDER not in prompt_text:
-                effective_prompt = VIDEO_PLACEHOLDER + " " + prompt_text
+                user_content = VIDEO_PLACEHOLDER + " " + prompt_text
             else:
-                effective_prompt = prompt_text
+                user_content = prompt_text
+            # Wrap in Qwen chat format so the model generates assistant reply (avoids
+            # single-token EOS when no assistant turn is present).
+            effective_prompt = (
+                QWEN_CHAT_USER_PREFIX
+                + user_content
+                + QWEN_CHAT_USER_SUFFIX
+                + QWEN_CHAT_ASSISTANT_PREFIX
+            )
             prompt: TextPrompt = TextPrompt(
                 prompt=effective_prompt,
                 multi_modal_data={"video": (frames_array, metadata)},

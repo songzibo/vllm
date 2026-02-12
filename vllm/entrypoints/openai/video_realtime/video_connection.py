@@ -146,16 +146,15 @@ class RealtimeVideoConnection:
                 )
                 return
             commit_evt = InputVideoBufferCommit(**event)
-            if commit_evt.final:
-                self._is_input_finished = True
-            # Always enqueue: frames → video chunk; no frames → text-only chunk (empty list)
-            # So "text-only" or "text first, then video" both work: set prompt then commit.
+            # Always enqueue: frames → video chunk; no frames → text-only chunk (empty list).
+            # Then if final: mark input finished and send end-of-stream (None) to the consumer.
             if self._frame_buffer:
                 self._video_chunk_queue.put_nowait(list(self._frame_buffer))
                 self._frame_buffer = []
             else:
                 self._video_chunk_queue.put_nowait([])
             if commit_evt.final:
+                self._is_input_finished = True
                 self._video_chunk_queue.put_nowait(None)
             if self.generation_task is None or self.generation_task.done():
                 await self._start_generation()
