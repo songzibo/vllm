@@ -20,6 +20,11 @@ logger = init_logger(__name__)
 # Default text prompt when client does not send one (video-only input).
 DEFAULT_VIDEO_PROMPT = "Describe what you see in the video."
 
+# Video placeholder required by the model so prompt replacement can inject video.
+# Used by Qwen2-VL/Qwen3-VL; other models may use different placeholders (set
+# prompt via session.update including the correct placeholder if needed).
+VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
+
 
 class OpenAIServingRealtimeVideo(OpenAIServing):
     """Realtime video understanding via WebSocket streaming.
@@ -88,8 +93,13 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
                 "frames_indices": list(range(num_frames)),
                 "do_sample_frames": True,
             }
+            # Prompt must contain the model's video placeholder for replacement.
+            if VIDEO_PLACEHOLDER not in prompt_text:
+                effective_prompt = VIDEO_PLACEHOLDER + " " + prompt_text
+            else:
+                effective_prompt = prompt_text
             prompt: TextPrompt = TextPrompt(
-                prompt=prompt_text,
+                prompt=effective_prompt,
                 multi_modal_data={"video": (frames_array, metadata)},
             )
             yield StreamingInput(prompt=prompt)
