@@ -30,6 +30,12 @@ Usage:
 
   # Custom prompt and model
   python openai_realtime_video_client.py --image-path frame.jpg --prompt "What is in this image?" --model Qwen2.5-VL-7B-Instruct
+
+Troubleshooting (no visible result):
+  - Server accepts at most 64 frames per commit. If you send more, you get an error.
+    Use --max-frames 64 or --frame-interval to send fewer frames.
+  - Long videos take time to encode; wait after "Waiting for completion...".
+  - Run with --verbose to print every message from the server (e.g. to see errors).
 """
 
 import argparse
@@ -153,6 +159,12 @@ async def run_realtime_video(
                 frame_interval=frame_interval,
             )
             print(f"Sending {len(frames_b64)} frames...")
+            if len(frames_b64) > 64:
+                print(
+                    "Warning: server accepts at most 64 frames per commit. "
+                    "Use --max-frames 64 or --frame-interval to send fewer.",
+                    flush=True,
+                )
             for b64 in frames_b64:
                 await ws.send(
                     json.dumps(
@@ -180,8 +192,14 @@ async def run_realtime_video(
                     print(f"Usage: {response['usage']}")
                 break
             elif t == "error":
-                print(f"\nError: {response.get('error', response)}")
+                err_msg = response.get("error", response.get("message", response))
+                print(f"\nError: {err_msg}", flush=True)
+                if response.get("code"):
+                    print(f"Code: {response['code']}", flush=True)
                 break
+            else:
+                # Debug: server sent an unexpected type (e.g. session.updated)
+                print(f"[Received type={t!r}] {response}", flush=True)
 
 
 def main():
