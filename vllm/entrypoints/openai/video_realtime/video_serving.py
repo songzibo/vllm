@@ -61,35 +61,35 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
 
     async def stream_video_realtime(
         self,
-        video_chunk_queue: asyncio.Queue[list | None],
+        video_batch_queue: asyncio.Queue[list | None],
         prompt_text: str = DEFAULT_VIDEO_PROMPT,
     ) -> AsyncGenerator[StreamingInput, None]:
-        """Turn queued video chunks into StreamingInput for engine.generate().
+        """Turn queued video batches into StreamingInput for engine.generate().
 
-        Each chunk is a list of frames (PIL Images or compatible). One chunk
-        is consumed per commit from the client.
+        Video is sent frame-by-frame; one batch = one commit's worth of frames (list of
+        PIL Images). None in the queue signals end of stream.
 
         Args:
-            video_chunk_queue: Queue of frame lists; None signals end of stream.
-            prompt_text: Text prompt to use with each video chunk.
+            video_batch_queue: Queue of frame lists (one per commit); None = EOS.
+            prompt_text: Text prompt to use with each batch.
 
         Yields:
             StreamingInput with TextPrompt + multi_modal_data["video"].
         """
         while True:
-            chunk = await video_chunk_queue.get()
-            if chunk is None:
+            batch = await video_batch_queue.get()
+            if batch is None:
                 break
             # Empty list = text-only turn (e.g. commit with no frames, or text after video).
-            if not chunk:
+            if not batch:
                 yield StreamingInput(
                     prompt=TextPrompt(prompt=prompt_text),
                 )
                 continue
             # Models like Qwen2-VL/Qwen3-VL require video metadata (fps, frames_indices, etc.).
             # Build (video_array, metadata) tuple; metadata format matches vllm video loaders.
-            num_frames = len(chunk)
-            frames_array = np.stack([np.array(img) for img in chunk])
+            num_frames = len(batch)
+            frames_array = np.stack([np.array(img) for img in batch])
             # Default fps=1 for streaming (no real timeline); duration = num_frames seconds.
             fps = 1.0
             metadata = {

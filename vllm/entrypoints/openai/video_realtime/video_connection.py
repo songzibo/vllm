@@ -20,6 +20,8 @@ from vllm.entrypoints.openai.video_realtime.protocol import (
     ErrorEvent,
     InputVideoBufferAppend,
     InputVideoBufferCommit,
+    InputVideoBufferWaterLevel,
+    InputVideoBufferWaterLevelEvent,
     SessionCreated,
 )
 from vllm.entrypoints.openai.video_realtime.video_serving import (
@@ -33,6 +35,10 @@ logger = init_logger(__name__)
 
 # Max frames per commit to avoid OOM (configurable via env if needed).
 DEFAULT_MAX_FRAMES_PER_COMMIT = 64
+
+# Bounded queue size for commit backpressure: server blocks on put when full.
+# Video is frame-by-frame; one "batch" = one commit's worth of frames (not fixed-size chunks like audio).
+DEFAULT_VIDEO_BATCH_QUEUE_MAXSIZE = 4
 
 def _decode_video_frame(payload_b64: str, fmt: str | None):
     """Decode base64 to a single frame (PIL Image) for multi_modal_data."""
@@ -54,8 +60,8 @@ class RealtimeVideoConnection:
     """Manages WebSocket lifecycle for realtime video understanding.
 
     - Session: session.update (model, optional prompt)
-    - Append: input_video_buffer.append (base64 frame/chunk)
-    - Commit: input_video_buffer.commit (process buffer, optional final)
+    - Append: input_video_buffer.append (base64 frame, one per message)
+    - Commit: input_video_buffer.commit (process buffer as one batch, optional final)
       - With frames: process video + prompt. With no frames: text-only turn (prompt only).
       - So "text-only" or "text first then streaming video" are supported.
     - Server sends: completion.delta, completion.done, error
@@ -67,12 +73,17 @@ class RealtimeVideoConnection:
         serving: OpenAIServingRealtimeVideo,
         *,
         max_frames_per_commit: int = DEFAULT_MAX_FRAMES_PER_COMMIT,
+        video_batch_queue_maxsize: int = DEFAULT_VIDEO_BATCH_QUEUE_MAXSIZE,
     ):
         self.websocket = websocket
         self.connection_id = f"ws-video-{uuid4()}"
         self.serving = serving
         self._frame_buffer: list = []
-        self._video_chunk_queue: asyncio.Queue[list | None] = asyncio.Queue()
+        # Queue of frame batches: one batch = one commit's frames (list of PIL Images), or None = EOS.
+        self._video_batch_queue: asyncio.Queue[list | None] = asyncio.Queue(
+            maxsize=video_batch_queue_maxsize
+        )
+        self._video_batch_queue_maxsize = video_batch_queue_maxsize
         self.generation_task: asyncio.Task | None = None
         self._is_connected = False
         self._is_input_finished = False
@@ -85,7 +96,15 @@ class RealtimeVideoConnection:
         await self.websocket.accept()
         logger.debug("WebSocket (video) connection accepted: %s", self.connection_id)
         self._is_connected = True
-        await self._send(SessionCreated())
+        await self._send(
+            SessionCreated(
+                input_video_buffer=InputVideoBufferWaterLevel(
+                    queue_depth=0,
+                    max_queue_size=self._video_batch_queue_maxsize - 1,
+                    buffer_frames=0,
+                )
+            )
+        )
 
         try:
             while True:
@@ -146,29 +165,37 @@ class RealtimeVideoConnection:
                 )
                 return
             commit_evt = InputVideoBufferCommit(**event)
-            # Always enqueue: frames → video chunk; no frames → text-only chunk (empty list).
-            # Then if final: mark input finished and send end-of-stream (None) to the consumer.
+            # Enqueue one batch: current buffer as list of frames, or empty list for text-only turn.
+            # Use await put() so we block when queue is full (backpressure to client).
             if self._frame_buffer:
-                self._video_chunk_queue.put_nowait(list(self._frame_buffer))
+                await self._video_batch_queue.put(list(self._frame_buffer))
                 self._frame_buffer = []
             else:
-                self._video_chunk_queue.put_nowait([])
+                await self._video_batch_queue.put([])
             if commit_evt.final:
                 self._is_input_finished = True
-                self._video_chunk_queue.put_nowait(None)
+                await self._video_batch_queue.put(None)
+            # Notify client of current water level so it can throttle before next send.
+            await self._send(
+                InputVideoBufferWaterLevelEvent(
+                    queue_depth=self._video_batch_queue.qsize(),
+                    max_queue_size=self._video_batch_queue_maxsize - 1,
+                    buffer_frames=len(self._frame_buffer),
+                )
+            )
             if self.generation_task is None or self.generation_task.done():
                 await self._start_generation()
         else:
             await self._send_error(f"Unknown event type: {event_type}", "unknown_event")
 
     async def _start_generation(self):
-        """Start the generation task for the current video chunk queue."""
+        """Start the generation task for the current video batch queue."""
         if self.generation_task is not None and not self.generation_task.done():
             logger.warning("Generation already in progress, ignoring commit")
             return
 
         stream_gen = self.serving.stream_video_realtime(
-            self._video_chunk_queue,
+            self._video_batch_queue,
             prompt_text=self._prompt_text,
         )
         self.generation_task = asyncio.create_task(
@@ -215,7 +242,7 @@ class RealtimeVideoConnection:
                         delta,
                         n_tokens,
                         len(full_text),
-                        self._video_chunk_queue.empty(),
+                        self._video_batch_queue.empty(),
                         self._is_input_finished,
                     )
                 out_iter += 1
@@ -236,11 +263,22 @@ class RealtimeVideoConnection:
                 completion_tokens=completion_tokens_len,
                 total_tokens=prompt_token_ids_len + completion_tokens_len,
             )
-            await self._send(CompletionDone(text=full_text, usage=usage))
+            water_level = InputVideoBufferWaterLevel(
+                queue_depth=self._video_batch_queue.qsize(),
+                max_queue_size=self._video_batch_queue_maxsize - 1,
+                buffer_frames=len(self._frame_buffer),
+            )
+            await self._send(
+                CompletionDone(
+                    text=full_text,
+                    usage=usage,
+                    input_video_buffer=water_level,
+                )
+            )
 
-            while not self._video_chunk_queue.empty():
+            while not self._video_batch_queue.empty():
                 try:
-                    self._video_chunk_queue.get_nowait()
+                    self._video_batch_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
@@ -262,7 +300,16 @@ class RealtimeVideoConnection:
 
     async def _cleanup(self):
         """Cleanup resources."""
-        self._video_chunk_queue.put_nowait(None)
         if self.generation_task and not self.generation_task.done():
             self.generation_task.cancel()
+        # Drain queue so we have room for None; then signal consumer to exit.
+        while not self._video_batch_queue.empty():
+            try:
+                self._video_batch_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        try:
+            self._video_batch_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
         logger.debug("Connection cleanup complete: %s", self.connection_id)
