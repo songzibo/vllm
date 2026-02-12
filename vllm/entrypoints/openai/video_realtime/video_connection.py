@@ -208,7 +208,7 @@ class RealtimeVideoConnection:
                     full_text += delta
                     await self._send(CompletionDelta(delta=delta))
                     completion_tokens_len += n_tokens
-                    logger.info(
+                    logger.debug(
                         "[realtime_video] output iter=%s delta=%r n_tokens=%s "
                         "full_len=%s queue_empty=%s input_finished=%s",
                         out_iter,
