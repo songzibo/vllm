@@ -15,7 +15,7 @@ Requirements:
 - vllm (with vision)
 - websockets
 - Pillow
-- opencv-python (optional, for video files)
+- opencv-python
 
 Usage:
   # From a video file: omit --max-frames or use --max-frames -1 to send the entire video
@@ -26,12 +26,6 @@ Usage:
 
   # Limit to 32 frames, every 10th frame
   python openai_realtime_video_client.py --video-path /path/to/video.mp4 --max-frames 32 --frame-interval 10
-
-  # From a single image
-  python openai_realtime_video_client.py --image-path /path/to/image.jpg
-
-  # Custom prompt and model
-  python openai_realtime_video_client.py --image-path frame.jpg --prompt "What is in this image?" --model Qwen2.5-VL-7B-Instruct
 
 Troubleshooting (no visible result):
   - Server accepts at most 64 frames per commit. If you send more, you get an error.
@@ -57,17 +51,6 @@ try:
     import cv2
 except ImportError:
     cv2 = None
-
-
-def image_to_base64_jpeg(image_path: str, quality: int = 85) -> str:
-    """Read image file and return base64-encoded JPEG."""
-    if Image is None:
-        raise RuntimeError("PIL is required. Install with: pip install Pillow")
-    with open(image_path, "rb") as f:
-        img = Image.open(f).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def video_frames_to_base64_jpeg(
@@ -119,8 +102,7 @@ async def run_realtime_video(
     port: int,
     model: str,
     prompt: str | None,
-    image_path: str | None,
-    video_path: str | None,
+    video_path: str,
     max_frames: int | None,
     frame_interval: int,
     batch_size: int,
@@ -144,117 +126,79 @@ async def run_realtime_video(
             payload["prompt"] = prompt
         await ws.send(json.dumps(payload))
 
-        if image_path:
-            print(f"Loading image: {image_path}")
-            b64 = image_to_base64_jpeg(image_path)
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "input_video_buffer.append",
-                        "video": b64,
-                        "format": "image/jpeg",
-                    }
-                )
-            )
-            await ws.send(json.dumps({"type": "input_video_buffer.commit", "final": True}))
-
-            print("Waiting for completion...\n")
-            while True:
-                response = json.loads(await ws.recv())
-                t = response.get("type")
-                if t == "completion.delta":
-                    print(response.get("delta", ""), end="", flush=True)
-                elif t == "completion.done":
-                    print(f"\n\nDone. Text: {response.get('text', '')}")
-                    if response.get("usage"):
-                        print(f"Usage: {response['usage']}")
-                    break
-                elif t == "error":
-                    err_msg = response.get("error", response.get("message", response))
-                    print(f"\nError: {err_msg}", flush=True)
-                    if response.get("code"):
-                        print(f"Code: {response['code']}", flush=True)
-                    break
-                else:
-                    print(f"[Received type={t!r}] {response}", flush=True)
-
-        elif video_path:
-            limit_str = f"max {max_frames} frames" if max_frames is not None else "all frames"
-            print(f"Loading video: {video_path} ({limit_str}, every {frame_interval} frame(s))")
-            frames_b64 = video_frames_to_base64_jpeg(
-                video_path,
-                max_frames=max_frames,
-                frame_interval=frame_interval,
-            )
-            num_batches = (len(frames_b64) + batch_size - 1) // batch_size if batch_size else 0
+        # Video streaming
+        limit_str = f"max {max_frames} frames" if max_frames is not None else "all frames"
+        print(f"Loading video: {video_path} ({limit_str}, every {frame_interval} frame(s))")
+        frames_b64 = video_frames_to_base64_jpeg(
+            video_path,
+            max_frames=max_frames,
+            frame_interval=frame_interval,
+        )
+        num_batches = (len(frames_b64) + batch_size - 1) // batch_size if batch_size else 0
+        print(
+            f"Sending {len(frames_b64)} frames in {num_batches} batch(es) "
+            f"(batch_size={batch_size}); send when water level allows (queue_depth < max_queue_size)."
+        )
+        if max_frames is not None and len(frames_b64) > max_frames:
             print(
-                f"Sending {len(frames_b64)} frames in {num_batches} batch(es) "
-                f"(batch_size={batch_size}); send when water level allows (queue_depth < max_queue_size)."
+                "Warning: server accepts at most 64 frames per commit. "
+                "Use --max-frames 64 or --frame-interval to send fewer.",
+                flush=True,
             )
-            if max_frames is not None and len(frames_b64) > max_frames:
-                print(
-                    "Warning: server accepts at most 64 frames per commit. "
-                    "Use --max-frames 64 or --frame-interval to send fewer.",
-                    flush=True,
-                )
 
-            # Single loop: get water level (from last recv), decide whether to send; else recv.
-            # Protocol: 4) get water level, decide; 5–6) send one batch (appends + commit); 7) recv until completion.done; 8) repeat.
-            queue_depth = 0
-            max_queue_size = initial_water.get("max_queue_size", 3)
-            batch_index = 0
-            received_done_count = 0
-            err: str | None = None
+        # Single loop: get water level (from last recv), decide whether to send; else recv.
+        queue_depth = 0
+        max_queue_size = initial_water.get("max_queue_size", 3)
+        batch_index = 0
+        received_done_count = 0
+        err: str | None = None
 
-            while received_done_count < num_batches and err is None:
-                # Get water level and decide whether to send
-                if batch_index < num_batches and queue_depth < max_queue_size:
-                    # Send one batch: multiple appends + one commit
-                    batch = frames_b64[batch_index * batch_size : (batch_index + 1) * batch_size]
-                    for b64 in batch:
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "input_video_buffer.append",
-                                    "video": b64,
-                                    "format": "image/jpeg",
-                                }
-                            )
-                        )
-                    is_final = batch_index == num_batches - 1
+        while received_done_count < num_batches and err is None:
+            # Get water level and decide whether to send
+            if batch_index < num_batches and queue_depth < max_queue_size:
+                # Send one batch: multiple appends + one commit
+                batch = frames_b64[batch_index * batch_size : (batch_index + 1) * batch_size]
+                for b64 in batch:
                     await ws.send(
-                        json.dumps({"type": "input_video_buffer.commit", "final": is_final})
+                        json.dumps(
+                            {
+                                "type": "input_video_buffer.append",
+                                "video": b64,
+                                "format": "image/jpeg",
+                            }
+                        )
                     )
-                    batch_index += 1
-                    queue_depth += 1  # optimistic until server sends next water level
-                    continue
-                # Receive one message, update water level or process completion/error
-                response = json.loads(await ws.recv())
-                t = response.get("type")
-                if t == "completion.delta":
-                    print(response.get("delta", ""), end="", flush=True)
-                elif t == "completion.done":
-                    print(f"\n\n[Batch {received_done_count + 1}] {response.get('text', '')}")
-                    if response.get("usage"):
-                        print(f"Usage: {response['usage']}")
-                    received_done_count += 1
-                    buf = response.get("input_video_buffer")
-                    if buf is not None:
-                        queue_depth = buf.get("queue_depth", queue_depth)
-                        max_queue_size = buf.get("max_queue_size", max_queue_size)
-                elif t == "input_video_buffer.water_level":
-                    queue_depth = response.get("queue_depth", queue_depth)
-                    max_queue_size = response.get("max_queue_size", max_queue_size)
-                elif t == "error":
-                    err = response.get("error", response.get("message", str(response)))
-                    print(f"\nError: {err}", flush=True)
-                    if response.get("code"):
-                        print(f"Code: {response['code']}", flush=True)
-                else:
-                    print(f"[Received type={t!r}] {response}", flush=True)
-        else:
-            print("Provide --image-path or --video-path")
-            return
+                is_final = batch_index == num_batches - 1
+                await ws.send(
+                    json.dumps({"type": "input_video_buffer.commit", "final": is_final})
+                )
+                batch_index += 1
+                queue_depth += 1  # optimistic until server sends next water level
+                continue
+            # Receive one message, update water level or process completion/error
+            response = json.loads(await ws.recv())
+            t = response.get("type")
+            if t == "completion.delta":
+                print(response.get("delta", ""), end="", flush=True)
+            elif t == "completion.done":
+                print(f"\n\n[Batch {received_done_count + 1}] {response.get('text', '')}")
+                if response.get("usage"):
+                    print(f"Usage: {response['usage']}")
+                received_done_count += 1
+                buf = response.get("input_video_buffer")
+                if buf is not None:
+                    queue_depth = buf.get("queue_depth", queue_depth)
+                    max_queue_size = buf.get("max_queue_size", max_queue_size)
+            elif t == "input_video_buffer.water_level":
+                queue_depth = response.get("queue_depth", queue_depth)
+                max_queue_size = response.get("max_queue_size", max_queue_size)
+            elif t == "error":
+                err = response.get("error", response.get("message", str(response)))
+                print(f"\nError: {err}", flush=True)
+                if response.get("code"):
+                    print(f"Code: {response['code']}", flush=True)
+            else:
+                print(f"[Received type={t!r}] {response}", flush=True)
 
 
 def main():
@@ -263,8 +207,7 @@ def main():
     )
     parser.add_argument("--model", type=str, default="Qwen2.5-VL-7B-Instruct")
     parser.add_argument("--prompt", type=str, default=None)
-    parser.add_argument("--image-path", type=str, default=None)
-    parser.add_argument("--video-path", type=str, default=None)
+    parser.add_argument("--video-path", type=str, required=True, help="Path to video file.")
     parser.add_argument(
         "--max-frames",
         type=int,
@@ -287,10 +230,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.image_path and not args.video_path:
-        parser.error("Provide at least one of --image-path or --video-path")
-
-    # None or -1 = send entire video
     max_frames = None if args.max_frames in (None, -1) else args.max_frames
 
     asyncio.run(
@@ -299,7 +238,6 @@ def main():
             args.port,
             args.model,
             args.prompt,
-            args.image_path,
             args.video_path,
             max_frames,
             args.frame_interval,
