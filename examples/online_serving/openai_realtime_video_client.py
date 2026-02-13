@@ -205,9 +205,9 @@ async def run_realtime_video(
             err: str | None = None
 
             while received_done_count < num_batches and err is None:
-                # 获取水位，判断是否需要发送
+                # Get water level and decide whether to send
                 if batch_index < num_batches and queue_depth < max_queue_size:
-                    # 5–6) 发送一个批次：append 若干帧 + commit
+                    # Send one batch: multiple appends + one commit
                     batch = frames_b64[batch_index * batch_size : (batch_index + 1) * batch_size]
                     for b64 in batch:
                         await ws.send(
@@ -226,7 +226,7 @@ async def run_realtime_video(
                     batch_index += 1
                     queue_depth += 1  # optimistic until server sends next water level
                     continue
-                # 7) 收一条消息，更新水位或处理 completion/error
+                # Receive one message, update water level or process completion/error
                 response = json.loads(await ws.recv())
                 t = response.get("type")
                 if t == "completion.delta":

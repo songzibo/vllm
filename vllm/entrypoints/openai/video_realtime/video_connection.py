@@ -79,7 +79,8 @@ class RealtimeVideoConnection:
         self.connection_id = f"ws-video-{uuid4()}"
         self.serving = serving
         self._frame_buffer: list = []
-        # Queue of frame batches: one batch = one commit's frames (list of PIL Images), or None = EOS.
+        # Queue of batches. One queue element = one batch (list of frames from one commit), or None = EOS.
+        # Multiple frames form one batch; the queue holds multiple batches (one generate per batch).
         self._video_batch_queue: asyncio.Queue[list | None] = asyncio.Queue(
             maxsize=video_batch_queue_maxsize
         )
@@ -100,7 +101,7 @@ class RealtimeVideoConnection:
             SessionCreated(
                 input_video_buffer=InputVideoBufferWaterLevel(
                     queue_depth=0,
-                    max_queue_size=self._video_batch_queue_maxsize - 1,
+                    max_queue_size=self._video_batch_queue_maxsize - 1,  # reserve one slot for EOS (None)
                     buffer_frames=0,
                 )
             )
