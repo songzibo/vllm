@@ -36,8 +36,8 @@ logger = init_logger(__name__)
 # Max frames per commit to avoid OOM (configurable via env if needed).
 DEFAULT_MAX_FRAMES_PER_COMMIT = 64
 
-# Bounded queue size for commit backpressure: server blocks on put when full.
-# Video is frame-by-frame; one "batch" = one commit's worth of frames (not fixed-size chunks like audio).
+# Max batches the client may have in flight (logical capacity). The physical queue has
+# one extra slot for the EOS sentinel (None), so put(None) never blocks.
 DEFAULT_VIDEO_BATCH_QUEUE_MAXSIZE = 4
 
 def _decode_video_frame(payload_b64: str, fmt: str | None):
@@ -79,12 +79,12 @@ class RealtimeVideoConnection:
         self.connection_id = f"ws-video-{uuid4()}"
         self.serving = serving
         self._frame_buffer: list = []
-        # Queue of batches. One queue element = one batch (list of frames from one commit), or None = EOS.
-        # Multiple frames form one batch; the queue holds multiple batches (one generate per batch).
+        # Queue: one element = one batch (list of frames) or None = EOS. Physical size = maxsize + 1
+        # so the extra slot is always available for put(None) when client sends final=True.
         self._video_batch_queue: asyncio.Queue[list | None] = asyncio.Queue(
-            maxsize=video_batch_queue_maxsize
+            maxsize=video_batch_queue_maxsize + 1
         )
-        self._video_batch_queue_maxsize = video_batch_queue_maxsize
+        self._video_batch_queue_maxsize = video_batch_queue_maxsize  # logical: max batches from client
         self.generation_task: asyncio.Task | None = None
         self._is_connected = False
         self._is_input_finished = False
@@ -101,7 +101,7 @@ class RealtimeVideoConnection:
             SessionCreated(
                 input_video_buffer=InputVideoBufferWaterLevel(
                     queue_depth=0,
-                    max_queue_size=self._video_batch_queue_maxsize - 1,  # reserve one slot for EOS (None)
+                    max_queue_size=self._video_batch_queue_maxsize,
                     buffer_frames=0,
                 )
             )
@@ -180,7 +180,7 @@ class RealtimeVideoConnection:
             await self._send(
                 InputVideoBufferWaterLevelEvent(
                     queue_depth=self._video_batch_queue.qsize(),
-                    max_queue_size=self._video_batch_queue_maxsize - 1,
+                    max_queue_size=self._video_batch_queue_maxsize,
                     buffer_frames=len(self._frame_buffer),
                 )
             )
@@ -253,7 +253,7 @@ class RealtimeVideoConnection:
                 )
                 water_level = InputVideoBufferWaterLevel(
                     queue_depth=self._video_batch_queue.qsize(),
-                    max_queue_size=self._video_batch_queue_maxsize - 1,
+                    max_queue_size=self._video_batch_queue_maxsize,
                     buffer_frames=len(self._frame_buffer),
                 )
                 await self._send(
