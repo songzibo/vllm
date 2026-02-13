@@ -18,7 +18,7 @@ Requirements:
 - opencv-python (optional, for video files)
 
 Usage:
-  # From a video file (sends all frames by default)
+  # From a video file: omit --max-frames or use --max-frames -1 to send the entire video
   python openai_realtime_video_client.py --video-path /path/to/video.mp4
 
   # Send every 25th frame (e.g. 1 frame per second for 25fps video)
@@ -80,7 +80,7 @@ def video_frames_to_base64_jpeg(
 
     Args:
         video_path: Path to the video file.
-        max_frames: Max number of frames to send; None = no limit (send all sampled).
+        max_frames: Max number of frames to send; None = no limit (send all sampled). Caller may pass -1 for no limit.
         frame_interval: Send every Nth frame (1 = every frame, 25 = every 25th frame).
         quality: JPEG quality for encoding.
     """
@@ -92,6 +92,8 @@ def video_frames_to_base64_jpeg(
         raise RuntimeError("PIL is required. Install with: pip install Pillow")
     if frame_interval < 1:
         raise ValueError("frame_interval must be >= 1")
+    if max_frames is not None and max_frames < 0:
+        max_frames = None  # -1 or any negative = no limit
     cap = cv2.VideoCapture(video_path)
     frames = []
     frame_idx = 0
@@ -267,7 +269,7 @@ def main():
         "--max-frames",
         type=int,
         default=None,
-        help="Max frames to send from video; default None = send all (after sampling).",
+        help="Max frames to send from video. Default or -1 = send entire video (all frames after frame-interval sampling).",
     )
     parser.add_argument(
         "--frame-interval",
@@ -288,6 +290,9 @@ def main():
     if not args.image_path and not args.video_path:
         parser.error("Provide at least one of --image-path or --video-path")
 
+    # None or -1 = send entire video
+    max_frames = None if args.max_frames in (None, -1) else args.max_frames
+
     asyncio.run(
         run_realtime_video(
             args.host,
@@ -296,7 +301,7 @@ def main():
             args.prompt,
             args.image_path,
             args.video_path,
-            args.max_frames,
+            max_frames,
             args.frame_interval,
             args.batch_size,
         )
