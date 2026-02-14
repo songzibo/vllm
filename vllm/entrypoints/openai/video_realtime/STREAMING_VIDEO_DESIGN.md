@@ -1,26 +1,77 @@
 # 流式视频输入完整方案 (Streaming Video Input Design)
 
-基于当前代码的流式视频理解方案说明：协议、数据模型、服务端/客户端行为与背压机制。
-
 ---
 
 ## 1. 概述与目标
 
-- **目标**：支持客户端按「批」持续推送视频帧，服务端对**每一批**做一次多模态理解并流式返回文本，实现**低延迟、实时**的视频理解，且单次请求不超出 `max_model_len`。
-- **约束**：发送节奏由服务端**水位（water level）**驱动，避免固定延迟或队列溢出；每批独立推理，不合并多批为一次长请求。
+- **目标**：支持客户端按「批」持续推送视频帧，服务端对**每一批**做一次多模态理解并流式返回文本，实现**低延迟、实时**的视频理解。
+
+
+**流式视频特性说明**：
+- **流式持续输入**：支持视频帧按批持续推流输入，而非原有视频一次加载到内存再处理；客户端按水位背压节奏发送，服务端每批独立推理，实现实时理解。
+- **提示词动态更新**：根据用户输入提示词，实时改变视频理解任务；客户端可随时发送 `session.update` 更新 prompt，后续批次将采用新提示词，无需重连。
 
 ---
 
-## 2. 相关文件说明
+## 2. 整体方案与数据流向
+
+### 2.1 整体架构（客户端 + 服务端）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  客户端（三种实现）                                                           │
+│  • openai_realtime_video_client.py        （短视频，一次性加载）              │
+│  • openai_realtime_video_client_async.py  （大视频，生成器逐帧）              │
+│  • openai_realtime_camera_client.py      （实时摄像头，Gradio）               │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │ WebSocket ws://host/v1/realtime_video
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  服务端                                                                      │
+│  api_router → RealtimeVideoConnection (video_connection.py)                 │
+│       → OpenAIServingRealtimeVideo (video_serving.py)                        │
+│       → engine_client.generate()                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **客户端**：从视频文件或摄像头获取帧，按批 base64 编码后，经 WebSocket 发送；根据服务端水位决定是否继续发送，避免队列溢出。
+- **服务端**：接收帧、打成 batch 入队，每批调用一次 `engine.generate()` 做多模态理解，流式返回文本；同时下发水位供客户端背压。
+
+### 2.2 数据流向：客户端 → 服务端（发送）
+
+| 阶段 | 客户端发送 | 服务端处理 |
+|------|------------|------------|
+| 连接 | 建立 WebSocket 连接 | 接受连接 |
+| 会话 | `session.update`（model、可选 prompt） | 校验 model、更新 `_prompt_text` |
+| 逐帧 | `input_video_buffer.append`（base64 帧，每帧一条） | 解码为 PIL Image，追加到 `_frame_buffer` |
+| 提交批次 | `input_video_buffer.commit`（可选 `final: true`） | 将 buffer 打成 batch 放入 `_video_batch_queue`；若 `final` 则放入 `None`（EOS）；发送 `input_video_buffer.water_level` |
+| 循环 | 当 `queue_depth < max_queue_size` 时继续发下一批 | 首次 commit 时启动 `_run_generation_loop`，从队列取 batch、构造 `StreamingInput`、调用 `engine.generate()` |
+
+数据形态：**帧（base64 JPEG）→ append 多条 → commit 一次 → 服务端 batch（PIL Image 列表）→ 队列中的一个单元**。
+
+### 2.3 数据流向：服务端 → 客户端（接收）
+
+| 阶段 | 服务端发送 | 客户端处理 |
+|------|------------|------------|
+| 会话创建 | `session.created`（含 `input_video_buffer`：`queue_depth`、`max_queue_size`） | 解析初始水位，后续根据 `queue_depth < max_queue_size` 决定是否发下一批 |
+| 水位更新 | `input_video_buffer.water_level`（每次 commit 后） | 更新本地 `queue_depth`、`max_queue_size` |
+| 流式输出 | `completion.delta`（每次生成一个 token） | 累计并展示文本 |
+| 批次完成 | `completion.done`（含 `text`、`usage`、`input_video_buffer` 最新水位） | 输出完整文本，更新水位，若还有批则继续发送 |
+| 异常 | `error`（message、code） | 打印错误并退出 |
+
+数据形态：**水位（背压控制） + 流式文本（completion.delta/done）**。
+
+### 2.4 相关文件
 
 | 路径 | 说明 |
 |------|------|
-| **vllm/entrypoints/openai/video_realtime/api_router.py** | 注册 WebSocket 路由 `GET /v1/realtime_video`，在连接建立后创建 `RealtimeVideoConnection` 并调用 `handle_connection()`；提供 `attach_router()` 与 `init_realtime_video_state()` 供 FastAPI 挂载路由与初始化 `OpenAIServingRealtimeVideo`。文档注释中写有完整 7 步协议说明。 |
-| **vllm/entrypoints/openai/video_realtime/video_connection.py** | 单连接处理器：维护 `_frame_buffer`（未 commit 的帧）、有界队列 `_video_batch_queue`、prompt 与 model 校验状态；处理 `session.update`、`input_video_buffer.append`、`input_video_buffer.commit`，在首次 commit 时启动 `_run_generation_loop()`，按批从队列取数据并调用引擎生成，向客户端发送 `completion.delta` / `completion.done` 及水位事件。 |
-| **vllm/entrypoints/openai/video_realtime/video_serving.py** | 流式视频的 serving 层：实现 `stream_video_realtime(video_batch_queue, prompt_text)` 异步生成器，从队列逐个取 batch（遇 `None` 结束），将每个 batch 转为 `StreamingInput`（空 batch 为纯文本，非空为 Qwen 风格 prompt + `multi_modal_data["video"]`），供 connection 层每批调用一次 `engine_client.generate()`。 |
-| **vllm/entrypoints/openai/video_realtime/protocol.py** | 协议事件与 Pydantic 模型：客户端事件 `InputVideoBufferAppend`、`InputVideoBufferCommit`；服务端事件 `SessionCreated`、`InputVideoBufferWaterLevel`、`InputVideoBufferWaterLevelEvent`、`CompletionDelta`、`CompletionDone`、`ErrorEvent`。水位结构包含 `queue_depth`、`max_queue_size`、`buffer_frames`。 |
-| **vllm/entrypoints/openai/video_realtime/__init__.py** | 包初始化文件（当前无导出）。 |
-| **examples/online_serving/openai_realtime_video_client.py** | 示例客户端：连接 `ws://host/v1/realtime_video`，发送 `session.update` 后按协议循环——根据水位判断是否发送下一批（多次 append + 一次 commit），并接收 `completion.delta` / `completion.done` / `input_video_buffer.water_level`；支持从本地图片或视频文件读取帧并 base64 发送。 |
+| **video_realtime/api_router.py** | 注册 WebSocket 路由，创建 `RealtimeVideoConnection` |
+| **video_realtime/video_connection.py** | 单连接处理：帧缓冲、队列、prompt、事件路由、generation 循环 |
+| **video_realtime/video_serving.py** | `stream_video_realtime`：队列 → `StreamingInput`，支持 `prompt_getter` |
+| **video_realtime/protocol.py** | 协议事件与 Pydantic 模型 |
+| **openai_realtime_video_client.py** | 同步视频客户端（短视频） |
+| **openai_realtime_video_client_async.py** | 异步视频客户端（大视频，生成器） |
+| **openai_realtime_camera_client.py** | 实时摄像头客户端（Gradio） |
 
 ---
 
@@ -41,7 +92,7 @@
 - **端点**：`ws://host/v1/realtime_video`
 - **流程**：
   1. 客户端连接。
-  2. 服务端发送 `session.created`，并在 `input_video_buffer` 中携带初始水位：`queue_depth=0`，`max_queue_size`（如 3，即 `queue maxsize - 1`，为 EOS 预留一槽）。
+  2. 服务端发送 `session.created`，并在 `input_video_buffer` 中携带初始水位：`queue_depth=0`，`max_queue_size`（如 4，即允许客户端在途的 batch 数；物理队列容量多一槽用于 EOS）。
   3. 客户端发送 `session.update`，携带 `model` 及可选 `prompt`。
   4. **获取水位、判断是否发送**：客户端根据当前 `queue_depth` 与 `max_queue_size`，仅当 `queue_depth < max_queue_size` 时发送下一批。
   5. **发送一个批次**：多次 `input_video_buffer.append`（每帧一条），再发一条 `input_video_buffer.commit`（可选 `final: true` 表示最后一批）。
@@ -49,6 +100,7 @@
   7. 重复步骤 4～6，最后一批 commit 时置 `final: true`。
 
 - **文本-only / 先文本后视频**：可先 `session.update` 带 prompt，再发**空** commit（buffer 中无帧）做一次纯文本轮；或先 append 若干帧再 commit 做「文本 + 视频」理解。
+- **prompt 动态更新**：客户端可在任意时刻发送 `session.update` 并携带新 `prompt`；服务端通过 `prompt_getter` 在每批处理时读取当前 prompt，后续批次将使用新 prompt，无需重连。
 
 ---
 
@@ -61,15 +113,15 @@
   - **状态**：`_frame_buffer`（当前未 commit 的帧）、`_video_batch_queue`（batch 队列）、`_prompt_text`、`_is_model_validated` 等。
   - **事件**：`session.update` → 校验 model、更新 prompt；`input_video_buffer.append` → 解码帧并追加到 `_frame_buffer`（超过 `max_frames_per_commit` 则报错）；`input_video_buffer.commit` → 将当前 buffer 打成**一个 batch** 放入队列，若 `final` 则再放入 `None`（EOS），并发送 `input_video_buffer.water_level`，必要时启动 generation 任务。
 - **video_serving.py**：将「队列中的 batch」转为引擎可消费的 `StreamingInput`。
-  - **stream_video_realtime(queue, prompt_text)**：异步生成器，从队列中逐个取 batch（遇 `None` 结束），每个 batch 构造一个 `StreamingInput`（空 batch 为纯文本；非空为 Qwen 风格 prompt + `multi_modal_data["video"]`），yield 给调用方。
+  - **stream_video_realtime(queue, prompt_text=..., prompt_getter=...)**：异步生成器，从队列中逐个取 batch（遇 `None` 结束），每个 batch 构造一个 `StreamingInput`（空 batch 为纯文本；非空为 Qwen 风格 prompt + `multi_modal_data["video"]`），yield 给调用方。若提供 `prompt_getter`，则每批处理时调用以获取当前 prompt，使 `session.update` 的 prompt 在运行中的 generation 循环中生效。
 - **protocol.py**：定义所有事件类型（客户端/服务端）及水位结构 `InputVideoBufferWaterLevel`（`queue_depth`, `max_queue_size`, `buffer_frames`）。
 
 ### 5.2 推理流程（每批一次 generate）
 
 - Connection 在**首次**收到 commit 时启动一个长期任务 `_run_generation_loop()`。
-- 该循环消费 `stream_video_realtime(...)`：每次 `__anext__()` 从队列取一个 batch（阻塞直到有数据或 EOS），得到**一个** `StreamingInput`。
+- 该循环消费 `stream_video_realtime(..., prompt_getter=lambda: self._prompt_text)`：每次 `__anext__()` 从队列取一个 batch（阻塞直到有数据或 EOS），得到**一个** `StreamingInput`。每批处理时通过 `prompt_getter` 读取当前 prompt，因此 `session.update` 的 prompt 变更会在后续批次生效。
 - 对该 `StreamingInput` 调用一次 `engine_client.generate(prompt=one_input(), ...)`，即**一次请求只包含当前 batch**，避免超长上下文。
-- 流式消费 generate 的输出，向客户端发送 `completion.delta`；本批结束后发送 `completion.done`，并在其中附带当前 `InputVideoBufferWaterLevel`（`queue_depth=qsize()`, `max_queue_size=maxsize-1`, `buffer_frames=len(_frame_buffer)`）。
+- 流式消费 generate 的输出，向客户端发送 `completion.delta`；本批结束后发送 `completion.done`，并在其中附带当前 `InputVideoBufferWaterLevel`（`queue_depth=qsize()`, `max_queue_size=video_batch_queue_maxsize`, `buffer_frames=len(_frame_buffer)`）。
 - 循环直到生成器结束（遇到队列中的 `None`）。
 
 ### 5.3 背压与水位
@@ -80,12 +132,20 @@
 
 ---
 
-## 6. 客户端行为（示例：openai_realtime_video_client.py）
+## 6. 客户端实现与使用方式
 
-- **单循环、水位驱动**：不再使用 `batch_delay` 或 `asyncio.Condition`。循环内：
-  - **若** `batch_index < num_batches` 且 `queue_depth < max_queue_size`：发送当前批（多次 append + 一次 commit），`batch_index += 1`，本地乐观更新 `queue_depth += 1`，然后 `continue`。
-  - **否则**：`await ws.recv()`，根据消息类型更新 `queue_depth` / `max_queue_size`（来自 `completion.done.input_video_buffer` 或 `input_video_buffer.water_level`），并处理 `completion.delta` / `completion.done` / `error`。
-- 循环条件：`received_done_count < num_batches && !err`，保证在收到所有批的完成事件或出错时退出。
+### 6.1 共通行为（所有客户端）
+
+- **单循环、水位驱动**：循环内根据 `queue_depth < max_queue_size` 决定是否发送下一批；否则 `await ws.recv()` 等待服务端消息并更新水位。
+- **协议一致**：均连接 `ws://host/v1/realtime_video`，发送 `session.update` 后按 append + commit 循环，接收 `completion.delta` / `completion.done` / `input_video_buffer.water_level`。
+
+### 6.2 三种客户端对比
+
+| 客户端 | 适用场景 | 帧来源 | 特点 |
+|--------|----------|--------|------|
+| **openai_realtime_video_client.py** | 短视频文件 | 本地视频，一次性加载到内存 | 实现简单，适合小视频；大视频会 OOM |
+| **openai_realtime_video_client_async.py** | 大视频文件 | 本地视频，生成器逐帧读取 | 使用 `video_frames_to_base64_jpeg_generator` + `run_in_executor` 批量拉取，内存占用低；支持 `-v` 调试 |
+| **openai_realtime_camera_client.py** | 实时摄像头 | OpenCV 摄像头，帧队列（满则 drop-oldest） | Gradio UI、界面内配置、`session.update` 动态改 prompt、Model Response 智能滚动 |
 
 ---
 
@@ -94,12 +154,32 @@
 | 字段 | 含义 | 用途 |
 |------|------|------|
 | **queue_depth** | 当前排队中的 batch 数量（`qsize()`） | 客户端仅当 `queue_depth < max_queue_size` 时发送下一批 |
-| **max_queue_size** | 允许在途的 batch 上限（服务端为 `maxsize - 1`） | 与 queue_depth 共同决定背压 |
+| **max_queue_size** | 允许在途的 batch 上限（即 `video_batch_queue_maxsize`） | 与 queue_depth 共同决定背压 |
 | **buffer_frames** | 当前 append 缓冲区中未 commit 的帧数 | 状态/调试，可选用于限流或展示 |
 
 ---
 
-## 8. 端到端时序（单批简化）
+## 8. WebSocket 保活机制（流式视频特需）
+
+### 8.1 问题与原因
+
+- **现象**：长时间 camera 流或大视频推理时，出现 `keepalive ping timeout; no close frame received`，连接被关闭。
+- **原因**：uvicorn 底层使用 websockets 库的协议级 ping/pong 保活。服务端每隔 `ws_ping_interval` 发送 ping，若在 `ws_ping_timeout` 内未收到客户端的 pong，则关闭连接。单批视频推理（`engine.generate`）可能耗时 30 秒乃至更久，期间无应用层消息，原 uvicorn 默认 20 秒超时过短。
+
+### 8.2 服务端修改
+
+- **cli_args.py**（FrontendArgs）：新增 `--ws-ping-interval`、`--ws-ping-timeout`，默认 60.0 秒（原 uvicorn 默认 20.0）。
+- **api_server.py**：`run_server_worker` 中将 `args.ws_ping_interval`、`args.ws_ping_timeout` 传入 `serve_http`，最终到达 uvicorn.Config。
+- **推荐**：长时间 camera 流可设为 `--ws-ping-interval 120 --ws-ping-timeout 120` 或更高。
+
+### 8.3 断开时的优雅处理（video_connection.py）
+
+- **_send**：捕获 `WebSocketDisconnect`、`ClientDisconnected`，设置 `_is_connected = False`，仅以 `logger.debug` 记录，避免 ERROR 级日志。
+- **推理循环**：对上述异常单独处理，仅打 debug 日志；真实错误才打 exception 并尝试 `_send_error`；若 `_send_error` 时连接已断，则静默忽略。
+
+---
+
+## 9. 端到端时序（单批简化）
 
 1. Client 连接 → Server 发送 `session.created`（含初始水位）。
 2. Client 发送 `session.update`（model, prompt）。
@@ -110,20 +190,21 @@
 
 ---
 
-## 9. 配置与限制
+## 10. 配置与限制
 
 - **每批最大帧数**：`DEFAULT_MAX_FRAMES_PER_COMMIT = 64`，防止单批过大 OOM。
 - **队列容量**：`DEFAULT_VIDEO_BATCH_QUEUE_MAXSIZE = 4` 表示允许客户端在途的 batch 数；物理队列为 `maxsize + 1`（多一槽给 EOS），客户端可见 `max_queue_size = 4`。
 - **模型与占位符**：当前 serving 层按 Qwen-VL 风格拼接 prompt 与占位符；其他模型需在 `session.update` 中提供合适 prompt/占位符。
+- **WebSocket keepalive**：详见第 8 节。流式视频特需，默认 60 秒；长时间流建议 120 秒或更高。
 
 ---
 
-## 10. 小结
+## 11. 小结
 
 - **流式输入**：帧级 append，按批 commit；队列中每单元 = 一个 batch。
 - **实时理解**：每批一次 `engine.generate()`，单请求不超长，延迟与批大小相关。
 - **背压**：有界队列 + 水位协议，客户端根据 `queue_depth` / `max_queue_size` 决定发送节奏，无需固定 delay。
-- **协议与实现**：完整流程见 `api_router.py` 的 WebSocket 注释；服务端逻辑见 `video_connection.py` 与 `video_serving.py`，客户端示例见 `examples/online_serving/openai_realtime_video_client.py`。
+- **协议与实现**：完整流程见 `api_router.py` 的 WebSocket 注释；服务端逻辑见 `video_connection.py` 与 `video_serving.py`。客户端示例：`openai_realtime_video_client.py`（短视频）、`openai_realtime_video_client_async.py`（大视频/低内存）、`openai_realtime_camera_client.py`（实时摄像头 + Gradio）。
 
 ### 用例说明
 
@@ -138,20 +219,45 @@ vllm serve /home/user/10T/user/weights/Qwen3-VL-2B-Instruct \
 ```
 
 - 使用 Qwen3-VL-2B-Instruct 等支持视频的视觉模型；`--max-model-len` 需满足单批 prompt 长度。
+- 长时间 camera 流建议加上：`--ws-ping-interval 120 --ws-ping-timeout 120`，避免 keepalive 超时断开。
 
-**2. 运行流式视频客户端**
+**2. 运行流式视频客户端（三种方式）**
+
+**方式一：短视频文件（一次性加载到内存）**
 
 ```bash
 python examples/online_serving/openai_realtime_video_client.py \
-  --video-path /home/user/10T/user/video_benchmark/Video-Bench/Driving-decision-making/4.mp4 \
+  --host <vllm_hostip> \
+  --port <vllm_port> \
   --model qwenvl \
+  --video-path /path/to/video.mp4 \
   --max-frames 64 \
   --frame-interval 25 \
   --batch-size 4
 ```
 
-- `--video-path`：本地视频文件。
-- `--model`：与服务端 `--served-model-name` 一致（如 `qwenvl`）。
-- `--max-frames 64`：最多发送 64 帧（与每批最大帧数一致，避免服务端报错）。
-- `--frame-interval 25`：每 25 帧取 1 帧（例如 25fps 视频约 1 帧/秒）。
-- `--batch-size 4`：每 4 帧为一批，每批触发一次 commit 与一次服务端理解；发送节奏由服务端水位背压控制。
+**方式二：大视频文件（生成器逐帧，低内存）**
+
+```bash
+python examples/online_serving/openai_realtime_video_client_async.py \
+  --host <vllm_hostip> \
+  --port <vllm_port> \
+  --model qwenvl \
+  --video-path /path/to/large.mp4 \
+  --max-frames 64 \
+  --frame-interval 25 \
+  --batch-size 16
+```
+
+**方式三：实时摄像头 + Gradio 界面**
+
+```bash
+python examples/online_serving/openai_realtime_camera_client.py \
+  --host <vllm_hostip> \
+  --port <vllm_port> \
+  --model qwenvl \
+  --batch-size 32 \
+  --gradio
+```
+
+**参数说明**：`--host` / `--port` 为 vLLM 服务地址；`--model` 与服务端 `--served-model-name` 一致。视频方式需 `--video-path`；`--max-frames 64` 与每批最大帧数一致；`--frame-interval` 为采样间隔（如 25 表示每 25 帧取 1 帧）；`--batch-size` 为每批帧数，发送节奏由服务端水位背压控制。
