@@ -496,6 +496,8 @@ async def run_server_worker(
             ssl_ciphers=args.ssl_ciphers,
             h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
             h11_max_header_count=args.h11_max_header_count,
+            ws_ping_interval=args.ws_ping_interval,
+            ws_ping_timeout=args.ws_ping_timeout,
             **uvicorn_kwargs,
         )
 

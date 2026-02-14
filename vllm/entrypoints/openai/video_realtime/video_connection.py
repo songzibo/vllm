@@ -13,6 +13,15 @@ from uuid import uuid4
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+try:
+    from uvicorn.protocols.utils import ClientDisconnected
+except ImportError:
+
+    class ClientDisconnected(Exception):  # type: ignore[no-redef]
+        """Placeholder when uvicorn not available."""
+
+        pass
+
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.openai.video_realtime.protocol import (
     CompletionDelta,
@@ -266,13 +275,30 @@ class RealtimeVideoConnection:
 
         except asyncio.CancelledError:
             pass
+        except (WebSocketDisconnect, ClientDisconnected):
+            logger.debug(
+                "Video generation stopped: client disconnected (%s)",
+                self.connection_id,
+            )
         except Exception as e:
             logger.exception("Error in video generation: %s", e)
-            await self._send_error(str(e), "processing_error")
+            try:
+                await self._send_error(str(e), "processing_error")
+            except (WebSocketDisconnect, ClientDisconnected):
+                pass
 
     async def _send(self, event):
-        """Send event to client."""
-        await self.websocket.send_text(event.model_dump_json())
+        """Send event to client. Sets _is_connected=False on disconnect."""
+        try:
+            await self.websocket.send_text(event.model_dump_json())
+        except (WebSocketDisconnect, ClientDisconnected) as e:
+            self._is_connected = False
+            logger.debug(
+                "WebSocket closed while sending (connection_id=%s): %s",
+                self.connection_id,
+                e,
+            )
+            raise
 
     async def _send_error(self, message: str, code: str | None = None):
         """Send error event to client."""

@@ -203,6 +203,12 @@ class FrontendArgs:
     h11_max_header_count: int = H11_MAX_HEADER_COUNT_DEFAULT
     """Maximum number of HTTP headers allowed in a request for h11 parser.
     Helps mitigate header abuse. Default: 256."""
+    ws_ping_interval: float = 60.0
+    """WebSocket ping interval in seconds. Increase for long-running streams
+    (e.g. realtime video) to avoid keepalive timeout. Default: 60.0."""
+    ws_ping_timeout: float = 60.0
+    """WebSocket ping timeout in seconds. Increase for long-running streams.
+    Default: 60.0."""
     log_error_stack: bool = envs.VLLM_SERVER_DEV_MODE
     """If set to True, log the stack trace of error responses"""
     tokens_only: bool = False
