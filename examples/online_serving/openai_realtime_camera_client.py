@@ -213,88 +213,88 @@ async def run_realtime_camera(
 
             try:
                 while err is None:
-                # Collect up to batch_size frames from queue
-                batch: list[str] = []
-                for _ in range(batch_size):
-                    try:
-                        batch.append(frame_queue.popleft())
-                    except IndexError:
-                        break
+                    # Collect up to batch_size frames from queue
+                    batch: list[str] = []
+                    for _ in range(batch_size):
+                        try:
+                            batch.append(frame_queue.popleft())
+                        except IndexError:
+                            break
 
-                # Send when we have frames and server has capacity
-                if batch and queue_depth < max_queue_size:
-                    for b64 in batch:
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "input_video_buffer.append",
-                                    "video": b64,
-                                    "format": "image/jpeg",
-                                }
+                    # Send when we have frames and server has capacity
+                    if batch and queue_depth < max_queue_size:
+                        for b64 in batch:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "input_video_buffer.append",
+                                        "video": b64,
+                                        "format": "image/jpeg",
+                                    }
+                                )
                             )
+                        # For live camera, we never send final=True until we stop
+                        await ws.send(
+                            json.dumps({"type": "input_video_buffer.commit", "final": False})
                         )
-                    # For live camera, we never send final=True until we stop
-                    await ws.send(
-                        json.dumps({"type": "input_video_buffer.commit", "final": False})
-                    )
-                    queue_depth += 1
-                    continue
-
-                if batch:
-                    # Put batch back for next iteration (we couldn't send yet)
-                    for b64 in reversed(batch):
-                        frame_queue.appendleft(b64)
-
-                # When queue is empty, don't block on recv (server won't send until we send first)
-                if len(frame_queue) == 0:
-                    await asyncio.sleep(0.05)
-                    continue
-
-                # Receive message (use timeout when prompt_queue so we can process prompts)
-                if prompt_queue is not None:
-                    try:
-                        msg_bytes = await asyncio.wait_for(ws.recv(), timeout=0.5)
-                    except asyncio.TimeoutError:
+                        queue_depth += 1
                         continue
-                else:
-                    msg_bytes = await ws.recv()
-                response = json.loads(msg_bytes)
-                t = response.get("type")
-                if t == "completion.delta":
-                    delta = response.get("delta", "")
-                    if update_display_frame:
-                        _append_response(delta)
+
+                    if batch:
+                        # Put batch back for next iteration (we couldn't send yet)
+                        for b64 in reversed(batch):
+                            frame_queue.appendleft(b64)
+
+                    # When queue is empty, don't block on recv (server won't send until we send first)
+                    if len(frame_queue) == 0:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    # Receive message (use timeout when prompt_queue so we can process prompts)
+                    if prompt_queue is not None:
+                        try:
+                            msg_bytes = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            continue
                     else:
-                        print(delta, end="", flush=True)
-                elif t == "completion.done":
-                    text = response.get("text", "")
-                    if update_display_frame:
-                        _append_response(f"\n\n[Batch {received_done_count + 1}] {text}")
-                        if response.get("usage"):
-                            _append_response(f"\nUsage: {response['usage']}")
+                        msg_bytes = await ws.recv()
+                    response = json.loads(msg_bytes)
+                    t = response.get("type")
+                    if t == "completion.delta":
+                        delta = response.get("delta", "")
+                        if update_display_frame:
+                            _append_response(delta)
+                        else:
+                            print(delta, end="", flush=True)
+                    elif t == "completion.done":
+                        text = response.get("text", "")
+                        if update_display_frame:
+                            _append_response(f"\n\n[Batch {received_done_count + 1}] {text}")
+                            if response.get("usage"):
+                                _append_response(f"\nUsage: {response['usage']}")
+                        else:
+                            print(f"\n\n[Batch {received_done_count + 1}] {text}")
+                            if response.get("usage"):
+                                print(f"Usage: {response['usage']}")
+                        received_done_count += 1
+                        buf = response.get("input_video_buffer")
+                        if buf is not None:
+                            queue_depth = buf.get("queue_depth", queue_depth)
+                            max_queue_size = buf.get("max_queue_size", max_queue_size)
+                    elif t == "input_video_buffer.water_level":
+                        queue_depth = response.get("queue_depth", queue_depth)
+                        max_queue_size = response.get("max_queue_size", max_queue_size)
+                    elif t == "error":
+                        err = response.get("error", response.get("message", str(response)))
+                        err_str = f"\nError: {err}"
+                        if response.get("code"):
+                            err_str += f"\nCode: {response['code']}"
+                        if update_display_frame:
+                            _append_response(err_str)
+                        else:
+                            print(err_str, flush=True)
                     else:
-                        print(f"\n\n[Batch {received_done_count + 1}] {text}")
-                        if response.get("usage"):
-                            print(f"Usage: {response['usage']}")
-                    received_done_count += 1
-                    buf = response.get("input_video_buffer")
-                    if buf is not None:
-                        queue_depth = buf.get("queue_depth", queue_depth)
-                        max_queue_size = buf.get("max_queue_size", max_queue_size)
-                elif t == "input_video_buffer.water_level":
-                    queue_depth = response.get("queue_depth", queue_depth)
-                    max_queue_size = response.get("max_queue_size", max_queue_size)
-                elif t == "error":
-                    err = response.get("error", response.get("message", str(response)))
-                    err_str = f"\nError: {err}"
-                    if response.get("code"):
-                        err_str += f"\nCode: {response['code']}"
-                    if update_display_frame:
-                        _append_response(err_str)
-                    else:
-                        print(err_str, flush=True)
-                else:
-                    print(f"[Received type={t!r}] {response}", flush=True)
+                        print(f"[Received type={t!r}] {response}", flush=True)
             finally:
                 if prompt_task is not None and not prompt_task.done():
                     prompt_task.cancel()
