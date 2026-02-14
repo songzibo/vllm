@@ -20,6 +20,10 @@ logger = init_logger(__name__)
 # Default text prompt when client does not send one (video-only input).
 DEFAULT_VIDEO_PROMPT = "Describe what you see in the video."
 
+# Qwen2-VL/Qwen3-VL require at least 2 frames; different models have different frame
+# requirements. Pad by repeating frames when insufficient, to satisfy model constraints.
+MIN_VIDEO_FRAMES = 2
+
 # Video placeholder required by the model so prompt replacement can inject video.
 # Used by Qwen2-VL/Qwen3-VL; other models may use different placeholders (set
 # prompt via session.update including the correct placeholder if needed).
@@ -78,6 +82,12 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
                 continue
             num_frames = len(batch)
             frames_array = np.stack([np.array(img) for img in batch])
+            if num_frames < MIN_VIDEO_FRAMES:
+                repeat = (MIN_VIDEO_FRAMES + num_frames - 1) // num_frames
+                frames_array = np.tile(frames_array, (repeat, 1, 1, 1))[:MIN_VIDEO_FRAMES]
+                num_frames = MIN_VIDEO_FRAMES
+            # frames_array shape: (num_frames, height, width, channels)
+            height, width = frames_array.shape[1], frames_array.shape[2]
             fps = 1.0
             metadata = {
                 "total_num_frames": num_frames,
@@ -86,6 +96,8 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
                 "video_backend": "realtime_stream",
                 "frames_indices": list(range(num_frames)),
                 "do_sample_frames": True,
+                "width": width,
+                "height": height,
             }
             if VIDEO_PLACEHOLDER not in prompt_text:
                 user_content = VIDEO_PLACEHOLDER + " " + prompt_text

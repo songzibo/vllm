@@ -281,9 +281,13 @@ class RealtimeVideoConnection:
         )
 
     async def _cleanup(self):
-        """Cleanup resources."""
+        """Cleanup resources. Awaits generation_task after cancel so shutdown doesn't hang."""
         if self.generation_task and not self.generation_task.done():
             self.generation_task.cancel()
+            try:
+                await asyncio.wait_for(self.generation_task, timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         # Drain queue so we have room for None; then signal consumer to exit.
         while not self._video_batch_queue.empty():
             try:

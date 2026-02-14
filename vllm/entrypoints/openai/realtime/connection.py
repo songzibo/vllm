@@ -278,8 +278,12 @@ class RealtimeConnection:
         # Signal audio stream to stop
         self.audio_queue.put_nowait(None)
 
-        # Cancel generation task if running
+        # Cancel generation task if running; await so shutdown doesn't hang on orphan tasks
         if self.generation_task and not self.generation_task.done():
             self.generation_task.cancel()
+            try:
+                await asyncio.wait_for(self.generation_task, timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
 
         logger.debug("Connection cleanup complete: %s", self.connection_id)
