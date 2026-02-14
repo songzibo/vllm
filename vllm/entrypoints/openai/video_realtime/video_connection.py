@@ -211,7 +211,7 @@ class RealtimeVideoConnection:
 
         stream_gen = self.serving.stream_video_realtime(
             self._video_batch_queue,
-            prompt_text=self._prompt_text,
+            prompt_getter=lambda: self._prompt_text,
         )
 
         try:

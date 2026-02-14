@@ -4,7 +4,7 @@
 """Serving layer for streaming video input via WebSocket."""
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 import numpy as np
 
@@ -67,18 +67,25 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
         self,
         video_batch_queue: asyncio.Queue[list | None],
         prompt_text: str = DEFAULT_VIDEO_PROMPT,
+        prompt_getter: Callable[[], str] | None = None,
     ) -> AsyncGenerator[StreamingInput, None]:
         """Turn queued video batches into StreamingInput for engine.generate().
 
         One batch (one commit) → one StreamingInput. None in the queue signals EOS.
         Caller can advance this generator once per batch and run one generate per yield.
+        If prompt_getter is set, it is called each iteration to support session.update
+        prompt changes; otherwise prompt_text is used as a static value.
         """
+        def _get_prompt() -> str:
+            return prompt_getter() if prompt_getter else prompt_text
+
         while True:
             batch = await video_batch_queue.get()
             if batch is None:
                 break
+            current_prompt = _get_prompt()
             if not batch:
-                yield StreamingInput(prompt=TextPrompt(prompt=prompt_text))
+                yield StreamingInput(prompt=TextPrompt(prompt=current_prompt))
                 continue
             num_frames = len(batch)
             frames_array = np.stack([np.array(img) for img in batch])
@@ -99,10 +106,10 @@ class OpenAIServingRealtimeVideo(OpenAIServing):
                 "width": width,
                 "height": height,
             }
-            if VIDEO_PLACEHOLDER not in prompt_text:
-                user_content = VIDEO_PLACEHOLDER + " " + prompt_text
+            if VIDEO_PLACEHOLDER not in current_prompt:
+                user_content = VIDEO_PLACEHOLDER + " " + current_prompt
             else:
-                user_content = prompt_text
+                user_content = current_prompt
             effective_prompt = (
                 QWEN_CHAT_USER_PREFIX
                 + user_content

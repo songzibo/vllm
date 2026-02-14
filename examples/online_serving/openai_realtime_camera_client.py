@@ -45,6 +45,7 @@ import base64
 import collections
 import io
 import json
+import os
 import queue
 import sys
 import threading
@@ -438,7 +439,43 @@ def create_gradio_demo(
     quality: int = 85,
 ) -> "gr.Blocks":
     """Create Gradio interface with parameter inputs and prompt send."""
-    with gr.Blocks(title="Real-time Camera Vision") as demo:
+    # Inline JS: stick to bottom unless user scrolls up; when at bottom, keep auto-scrolling
+    scroll_js = """
+    <script>
+    (function(){
+      var userScrolledUp = false;
+      function isAtBottom(ta){
+        return ta.scrollHeight - ta.scrollTop - ta.clientHeight < 10;
+      }
+      function run(){
+        var el = document.getElementById("model-response-output");
+        if(!el) return;
+        var ta = el.tagName==="TEXTAREA" ? el : el.querySelector("textarea");
+        if(!ta) return;
+        if(!userScrolledUp || isAtBottom(ta)) ta.scrollTop = ta.scrollHeight;
+      }
+      function onScroll(){
+        var el = document.getElementById("model-response-output");
+        if(!el) return;
+        var ta = el.tagName==="TEXTAREA" ? el : el.querySelector("textarea");
+        if(!ta) return;
+        userScrolledUp = !isAtBottom(ta);
+      }
+      function start(){
+        var el = document.getElementById("model-response-output");
+        if(!el){ setTimeout(start, 200); return; }
+        var ta = el.tagName==="TEXTAREA" ? el : el.querySelector("textarea");
+        if(ta) ta.addEventListener("scroll", onScroll, {passive:true});
+        setInterval(run, 100);
+      }
+      if(document.readyState==="loading")
+        document.addEventListener("DOMContentLoaded", start);
+      else
+        setTimeout(start, 500);
+    })();
+    </script>
+    """
+    with gr.Blocks(title="Real-time Camera Vision", head=scroll_js) as demo:
         gr.Markdown("# Real-time Camera Vision")
         gr.Markdown(
             "Set parameters below (or use defaults from command line), click **Start**. "
@@ -492,6 +529,7 @@ def create_gradio_demo(
                     label="Model Response",
                     lines=12,
                     max_lines=25,
+                    elem_id="model-response-output",
                 )
                 gr.Markdown("### Send new prompt (session.update)")
                 with gr.Row():
