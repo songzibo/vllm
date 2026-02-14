@@ -30,8 +30,11 @@ Usage:
   # Limit queue size (drop old when full)
   python openai_realtime_camera_client.py --queue-size 32 --frame-interval 5
 
-  # Gradio UI (image + text side by side)
+  # Gradio UI: set all parameters in the interface, send new prompts anytime
   python openai_realtime_camera_client.py --gradio
+
+  # Gradio with CLI defaults (override in UI)
+  python openai_realtime_camera_client.py --gradio --port 8000 --camera-id 0
 
 Press Ctrl+C to stop.
 """
@@ -42,6 +45,7 @@ import base64
 import collections
 import io
 import json
+import queue
 import threading
 
 import websockets
@@ -68,8 +72,8 @@ dropped_count = 0
 latest_display_frame = None  # RGB numpy array for Gradio
 response_text = ""  # Model output for Gradio
 
-# Config for Gradio (set before launch)
-_gradio_config: dict | None = None
+# For Gradio: prompts to send (session.update) when user sends new prompt
+_prompt_queue: queue.Queue | None = None
 
 
 def _append_response(s: str) -> None:
@@ -134,6 +138,7 @@ async def run_realtime_camera(
     batch_size: int,
     queue_size: int,
     quality: int,
+    prompt_queue: queue.Queue | None = None,
     update_display_frame: bool = False,
 ):
     """Stream camera frames to realtime video WebSocket."""
@@ -173,12 +178,41 @@ async def run_realtime_camera(
                 payload["prompt"] = prompt
             await ws.send(json.dumps(payload))
 
+            # Background task: when user sends new prompt via UI, send session.update + empty commit
+            prompt_task: asyncio.Task | None = None
+            if prompt_queue is not None:
+
+                async def prompt_sender() -> None:
+                    while True:
+                        try:
+                            new_prompt = prompt_queue.get_nowait()
+                            await ws.send(
+                                json.dumps({
+                                    "type": "session.update",
+                                    "model": model,
+                                    "prompt": new_prompt or "",
+                                })
+                            )
+                            await ws.send(
+                                json.dumps({"type": "input_video_buffer.commit", "final": False})
+                            )
+                            if update_display_frame:
+                                _append_response(f"\n[Prompt updated] {new_prompt}\n")
+                            else:
+                                print(f"\n[Prompt updated] {new_prompt}", flush=True)
+                        except queue.Empty:
+                            pass
+                        await asyncio.sleep(0.05)
+
+                prompt_task = asyncio.create_task(prompt_sender())
+
             queue_depth = 0
             max_queue_size = initial_water.get("max_queue_size", 3)
             received_done_count = 0
             err: str | None = None
 
-            while err is None:
+            try:
+                while err is None:
                 # Collect up to batch_size frames from queue
                 batch: list[str] = []
                 for _ in range(batch_size):
@@ -216,8 +250,15 @@ async def run_realtime_camera(
                     await asyncio.sleep(0.05)
                     continue
 
-                # Receive message
-                response = json.loads(await ws.recv())
+                # Receive message (use timeout when prompt_queue so we can process prompts)
+                if prompt_queue is not None:
+                    try:
+                        msg_bytes = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                else:
+                    msg_bytes = await ws.recv()
+                response = json.loads(msg_bytes)
                 t = response.get("type")
                 if t == "completion.delta":
                     delta = response.get("delta", "")
@@ -254,6 +295,13 @@ async def run_realtime_camera(
                         print(err_str, flush=True)
                 else:
                     print(f"[Received type={t!r}] {response}", flush=True)
+            finally:
+                if prompt_task is not None and not prompt_task.done():
+                    prompt_task.cancel()
+                    try:
+                        await prompt_task
+                    except asyncio.CancelledError:
+                        pass
     except asyncio.CancelledError:
         pass
     finally:
@@ -279,8 +327,16 @@ def websocket_handler(
     try:
         loop.run_until_complete(
             run_realtime_camera(
-                host, port, model, prompt,
-                camera_id, frame_interval, batch_size, queue_size, quality,
+                host,
+                port,
+                model,
+                prompt,
+                camera_id,
+                frame_interval,
+                batch_size,
+                queue_size,
+                quality,
+                prompt_queue=_prompt_queue,
                 update_display_frame=True,
             )
         )
@@ -288,19 +344,40 @@ def websocket_handler(
         print(f"WebSocket error: {e}")
 
 
-def start_camera_service() -> tuple:
+def send_prompt(prompt: str) -> tuple:
+    """Gradio callback: enqueue new prompt for session.update."""
+    global _prompt_queue
+    if _prompt_queue is not None and prompt and prompt.strip():
+        _prompt_queue.put(prompt.strip())
+    return gr.update(value="")  # Clear the input
+
+
+def start_camera_service(
+    host: str,
+    port: int,
+    model: str,
+    prompt: str,
+    camera_id: int,
+    frame_interval: int,
+    batch_size: int,
+    queue_size: int,
+    quality: int,
+) -> tuple:
     """Start the camera + WebSocket service (Gradio Start button)."""
-    global response_text, _gradio_config
-    if _gradio_config is None:
-        return gr.update(), gr.update()
+    global response_text
     response_text = ""
-    cfg = _gradio_config
     thread = threading.Thread(
         target=websocket_handler,
         args=(
-            cfg["host"], cfg["port"], cfg["model"], cfg["prompt"],
-            cfg["camera_id"], cfg["frame_interval"], cfg["batch_size"],
-            cfg["queue_size"], cfg["quality"],
+            host or "localhost",
+            int(port) if port else 8000,
+            model or "Qwen2.5-VL-7B-Instruct",
+            prompt.strip() if prompt else None,
+            int(camera_id) if camera_id is not None else 0,
+            int(frame_interval) if frame_interval else 1,
+            int(batch_size) if batch_size else 16,
+            int(queue_size) if queue_size else 64,
+            int(quality) if quality else 85,
         ),
         daemon=True,
     )
@@ -323,52 +400,105 @@ def get_latest_display() -> tuple:
 
 
 def create_gradio_demo(
-    host: str,
-    port: int,
-    model: str,
-    prompt: str | None,
-    camera_id: int,
-    frame_interval: int,
-    batch_size: int,
-    queue_size: int,
+    host: str = "localhost",
+    port: int = 8000,
+    model: str = "Qwen2.5-VL-7B-Instruct",
+    prompt: str | None = None,
+    camera_id: int = 0,
+    frame_interval: int = 1,
+    batch_size: int = 16,
+    queue_size: int = 64,
     quality: int = 85,
 ) -> "gr.Blocks":
-    """Create Gradio interface with image and text side by side."""
-    global _gradio_config
-    _gradio_config = {
-        "host": host,
-        "port": port,
-        "model": model,
-        "prompt": prompt,
-        "camera_id": camera_id,
-        "frame_interval": frame_interval,
-        "batch_size": batch_size,
-        "queue_size": queue_size,
-        "quality": quality,
-    }
+    """Create Gradio interface with parameter inputs and prompt send."""
     with gr.Blocks(title="Real-time Camera Vision") as demo:
         gr.Markdown("# Real-time Camera Vision")
-        gr.Markdown("Click **Start** to capture from camera and stream to the vision model.")
-
+        gr.Markdown(
+            "Set parameters below (or use defaults from command line), click **Start**. "
+            "You can send new prompts at any time; each sends a `session.update` to the server."
+        )
         with gr.Row():
-            image_out = gr.Image(label="Camera", height=400)
-            text_out = gr.Textbox(label="Model Response", lines=12, max_lines=20)
-
-        with gr.Row():
-            start_btn = gr.Button("Start", variant="primary")
-            stop_btn = gr.Button("Stop", variant="stop", interactive=False)
+            with gr.Column(scale=1):
+                host_in = gr.Textbox(label="Host", value=host or "localhost")
+                port_in = gr.Number(label="Port", value=port or 8000, precision=0)
+                model_in = gr.Textbox(
+                    label="Model",
+                    value=model or "Qwen2.5-VL-7B-Instruct",
+                )
+                prompt_in = gr.Textbox(
+                    label="Initial Prompt (optional)",
+                    value=prompt or "",
+                    placeholder="Describe what you see.",
+                    lines=2,
+                )
+                camera_id_in = gr.Number(
+                    label="Camera ID",
+                    value=camera_id,
+                    precision=0,
+                )
+                frame_interval_in = gr.Number(
+                    label="Frame Interval",
+                    value=frame_interval,
+                    precision=0,
+                )
+                batch_size_in = gr.Number(
+                    label="Batch Size",
+                    value=batch_size,
+                    precision=0,
+                )
+                queue_size_in = gr.Number(
+                    label="Queue Size",
+                    value=queue_size,
+                    precision=0,
+                )
+                quality_in = gr.Number(
+                    label="Quality (1-100)",
+                    value=quality,
+                    precision=0,
+                )
+                with gr.Row():
+                    start_btn = gr.Button("Start", variant="primary")
+                    stop_btn = gr.Button("Stop", variant="stop", interactive=False)
+            with gr.Column(scale=1):
+                image_out = gr.Image(label="Camera", height=400)
+                text_out = gr.Textbox(
+                    label="Model Response",
+                    lines=12,
+                    max_lines=25,
+                )
+                gr.Markdown("### Send new prompt (session.update)")
+                with gr.Row():
+                    new_prompt_in = gr.Textbox(
+                        label="New Prompt",
+                        placeholder="Type and click Send to update prompt",
+                        scale=4,
+                    )
+                    send_btn = gr.Button("Send", scale=1)
 
         start_btn.click(
             start_camera_service,
-            inputs=[],
+            inputs=[
+                host_in,
+                port_in,
+                model_in,
+                prompt_in,
+                camera_id_in,
+                frame_interval_in,
+                batch_size_in,
+                queue_size_in,
+                quality_in,
+            ],
             outputs=[start_btn, stop_btn],
         )
         stop_btn.click(
             stop_camera_service,
             outputs=[start_btn, stop_btn],
         )
-
-        # Periodic update: refresh image and text every 100ms
+        send_btn.click(
+            send_prompt,
+            inputs=[new_prompt_in],
+            outputs=[new_prompt_in],
+        )
         demo.load(
             get_latest_display,
             outputs=[image_out, text_out],
@@ -434,10 +564,18 @@ def main():
     if args.gradio:
         if gr is None:
             raise RuntimeError("gradio is required for --gradio. Install with: pip install gradio")
+        global _prompt_queue
+        _prompt_queue = queue.Queue()
         demo = create_gradio_demo(
-            args.host, args.port, args.model, args.prompt,
-            args.camera_id, args.frame_interval, args.batch_size, args.queue_size,
-            args.quality,
+            host=args.host,
+            port=args.port,
+            model=args.model,
+            prompt=args.prompt,
+            camera_id=args.camera_id,
+            frame_interval=args.frame_interval,
+            batch_size=args.batch_size,
+            queue_size=args.queue_size,
+            quality=args.quality,
         )
         demo.launch(share=args.share)
         return
